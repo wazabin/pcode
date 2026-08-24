@@ -1,0 +1,15 @@
+[package]
+name = "pcode-types"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Shared p-code vocabulary types: memory spaces, registers, and user-op ids"
+readme = "README.md"
+
+[lib]
+name = "pcode_types"
+
+[dependencies]
+jstd = { version = "0.1.0", path = "../../jstd/jstd" }
+serde = { version = "1", features = ["derive"] }
