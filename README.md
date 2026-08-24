@@ -1,4 +1,4 @@
-# pcode-types
+# wazabin-pcode
 
 Shared vocabulary types for p-code producers and consumers: memory spaces,
 registers, and user-defined operation identifiers.

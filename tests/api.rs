@@ -12,13 +12,23 @@ impl SpaceStore for Spaces {
 }
 
 #[test]
-fn identifiers_round_trip_through_usize() {
+fn identifiers_implement_the_expected_traits() {
     let register = RegisterId::new(3);
     let operation = PCodeOpId::new(7);
+    let space = SpaceId::new(2);
 
     assert_eq!(usize::from(register), 3);
     assert_eq!(usize::from(operation), 7);
     assert_eq!(usize::from(SPACE_CONST), 0);
+    assert_eq!(RegisterId::default(), RegisterId::new(0));
+    assert_eq!(register.clone(), register);
+    assert!(RegisterId::new(2) < register);
+    assert_eq!(format!("{operation}"), "7");
+
+    let bytes = bincode::serde::encode_to_vec(space, bincode::config::standard()).unwrap();
+    let (decoded, _): (SpaceId, _) =
+        bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+    assert_eq!(decoded, space);
 }
 
 #[test]
@@ -33,6 +43,7 @@ fn spaces_can_be_created_and_resolved() {
     assert_eq!(resolved.addr_size, 8);
     assert!(matches!(resolved.ty, SpaceType::Ram));
     assert_eq!(resolved.to_string(), "ram");
+    assert_eq!(Space::new(None, 2, 4).to_string(), "space");
 }
 
 #[test]

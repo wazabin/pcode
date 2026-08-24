@@ -1,5 +1,5 @@
 [package]
-name = "pcode-types"
+name = "wazabin-pcode"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
@@ -13,3 +13,6 @@ name = "pcode_types"
 [dependencies]
 jstd = { version = "0.1.0", path = "../../jstd/jstd" }
 serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+bincode = { version = "2", features = ["serde"] }
