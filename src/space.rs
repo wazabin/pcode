@@ -25,8 +25,10 @@ pub enum SpaceType {
     Ram,
     /// Read-only memory (e.g. flash, ROM).
     Rom,
-    /// Processor registers
+    /// Processor registers.
     Register,
+    /// Per-instruction temporary storage used by raw p-code operations.
+    Unique,
 }
 
 pub type SpaceRef<'ctx> = Identified<SpaceId, &'ctx Space>;
@@ -69,6 +71,16 @@ impl Space {
             word_size,
             addr_size,
             ty: SpaceType::Ram,
+        }
+    }
+
+    /// Creates the unique space used for instruction-local p-code temporaries.
+    pub fn unique(addr_size: usize) -> Self {
+        Self {
+            name: Some(Box::from("unique")),
+            word_size: 1,
+            addr_size,
+            ty: SpaceType::Unique,
         }
     }
 

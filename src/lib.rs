@@ -7,14 +7,31 @@
 //! the definitions live here rather than in either crate — which lets the
 //! decoder and the IR depend on each other only through this vocabulary.
 //!
-//! These types are serialization-stable: they appear directly in precompiled
-//! specification blobs, so their field layout must not change casually.
+//! These types appear directly in precompiled specification blobs, so their
+//! serialized form is part of the producer/consumer compatibility contract.
+//! A producer must version its blob format; serde alone does not provide a
+//! cross-version or cross-platform wire-format guarantee.
 
+pub mod error;
+pub mod expression;
+pub mod instruction;
 pub mod register;
 pub mod space;
+pub mod statement;
 
+pub use error::{PcodeError, PcodeErrorTy, PcodeResult};
+pub use expression::{
+    BinaryOperator, Binop, Builtin, Expression, ExpressionTy, Ident, Load, LocalVarId,
+    LocalVarInterner, Range, RangeParam, SpaceRef as PcodeSpaceRef, UnaryOperator, Unop,
+    pretty_print_ident,
+};
+pub use instruction::{
+    BitRangeInfo, InstructionPcode, Opcode, PcodeLowerError, PcodeLoweringContext, PcodeOp,
+    Varnode, lower_instruction,
+};
 pub use register::{Register, RegisterId, RegisterMutRef, RegisterRef};
 pub use space::{SPACE_CONST, Space, SpaceId, SpaceRef, SpaceStore, SpaceType};
+pub use statement::{Ast, AstNode, DelaySlotArg, LabelOrNode};
 
 use jstd::Identifier;
 
@@ -24,3 +41,49 @@ use jstd::Identifier;
 /// with no p-code semantics, which a consumer must interpret itself.
 #[derive(Identifier)]
 pub struct PCodeOpId(usize);
+
+/// Identifier used by source-shaped p-code for a decoder field.
+#[derive(Identifier)]
+pub struct FieldId(usize);
+/// Identifier used by `build` statements for a decoder table.
+#[derive(Identifier)]
+pub struct TableId(usize);
+/// Identifier of a p-code macro definition.
+#[derive(Identifier)]
+pub struct PMacroId(usize);
+/// Identifier of a named register bit range.
+#[derive(Identifier)]
+pub struct BitRangeFieldId(usize);
+
+/// Backend-neutral, source-shaped p-code AST for one decoded instruction.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct PcodeAst {
+    /// Statements in execution order.
+    pub statements: Vec<Ast>,
+}
+
+impl PcodeAst {
+    /// Pretty-prints the statements using a producer-specific name resolver.
+    pub fn pretty_print(&self, resolver: &impl PcodeResolver) -> String {
+        self.statements
+            .iter()
+            .map(|statement| statement.pretty_print(resolver))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+/// Supplies names for formatting a p-code AST without coupling it to a
+/// particular producer such as SLEIGH.
+pub trait PcodeResolver {
+    /// Name of an identifier.
+    fn ident_name(&self, ident: &Ident) -> String;
+    /// Name of a field.
+    fn field_name(&self, id: FieldId) -> String;
+    /// Name of an address space.
+    fn space_name(&self, id: SpaceId) -> String;
+    /// Name of a user-defined operation.
+    fn pcode_op_name(&self, id: PCodeOpId) -> String;
+    /// Name of a macro.
+    fn macro_name(&self, id: PMacroId) -> String;
+}
