@@ -1015,6 +1015,22 @@ impl<'a, C: PcodeLoweringContext + ?Sized> Lowerer<'a, C> {
         requested_output: Option<Varnode>,
     ) -> Result<Varnode, PcodeLowerError> {
         if let UnaryOperator::AddressOf(size) = op {
+            // Address-of folds at disassembly time and emits no p-code, so it
+            // needs a symbol with a static address. An address symbol such as
+            // `inst_next` already *is* that address; taking its address only
+            // fixes the width.
+            if let ExpressionTy::SizedInt {
+                value,
+                size: literal_size,
+            } = &operand.ty
+            {
+                let size = size
+                    .or(*literal_size)
+                    .or(operand.size)
+                    .ok_or(PcodeLowerError::UnknownSize)?;
+                return self
+                    .copy_if_requested(Varnode::constant(*value, size), requested_output);
+            }
             let storage = self.storage_from_expr(operand)?;
             let size = size
                 .or_else(|| self.context.address_size(storage.space))
