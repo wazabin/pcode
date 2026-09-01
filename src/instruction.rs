@@ -432,6 +432,11 @@ impl LabelId {
     pub const fn index(self) -> usize {
         self.0 as usize
     }
+
+    /// Rebuilds a label from an index returned by [`index`](Self::index).
+    pub const fn from_index(index: usize) -> Self {
+        Self(index as u32)
+    }
 }
 
 /// Whole-instruction facts a consumer needs before p-code emission starts.
@@ -446,6 +451,9 @@ pub struct PcodePlan {
     /// emitter can allocate a local's temporary.
     local_sizes: HashMap<LocalVarId, usize>,
     labels: Vec<Box<str>>,
+    /// Whether each label stands at the end of the instruction, where it is
+    /// the machine instruction's fall-through rather than a local block.
+    terminal: Vec<bool>,
     label_ids: HashMap<Box<str>, LabelId>,
     direct_branches: Vec<u64>,
     direct_calls: Vec<u64>,
@@ -455,6 +463,14 @@ impl PcodePlan {
     /// Names of the instruction-local labels, indexed by [`LabelId::index`].
     pub fn labels(&self) -> &[Box<str>] {
         &self.labels
+    }
+
+    /// Returns whether `label` stands after this instruction's last
+    /// operation. Such a label is the machine instruction's fall-through: a
+    /// consumer should send a branch to it wherever execution continues after
+    /// the instruction, rather than open a block for it.
+    pub fn is_terminal(&self, label: LabelId) -> bool {
+        self.terminal[label.index()]
     }
 
     /// Addresses this instruction can reach with a direct branch.
@@ -467,19 +483,39 @@ impl PcodePlan {
         &self.direct_calls
     }
 
-    fn label_id(&self, label: &str) -> Option<LabelId> {
-        self.label_ids.get(label).copied()
-    }
-
-    fn define_label(&mut self, label: &str) {
-        if self.label_ids.contains_key(label) {
-            // A duplicate definition is an emission-time error, reported with
-            // the label's name; planning keeps one identifier per name.
-            return;
+    /// Declares an instruction-local label and returns its identifier.
+    ///
+    /// A name is only assigned one identifier: a duplicate *definition* is an
+    /// emission-time error, reported with the name. This is public so a
+    /// consumer holding already-flattened p-code can rebuild an equivalent
+    /// plan for the same emitter.
+    pub fn declare_label(&mut self, label: &str) -> LabelId {
+        if let Some(id) = self.label_ids.get(label) {
+            return *id;
         }
         let id = LabelId(self.labels.len() as u32);
         self.labels.push(Box::from(label));
+        self.terminal.push(false);
         self.label_ids.insert(Box::from(label), id);
+        id
+    }
+
+    /// Declares an address this instruction can reach with a direct branch.
+    pub fn declare_direct_branch(&mut self, address: u64) {
+        if !self.direct_branches.contains(&address) {
+            self.direct_branches.push(address);
+        }
+    }
+
+    /// Declares an address this instruction can reach with a direct call.
+    pub fn declare_direct_call(&mut self, address: u64) {
+        if !self.direct_calls.contains(&address) {
+            self.direct_calls.push(address);
+        }
+    }
+
+    fn label_id(&self, label: &str) -> Option<LabelId> {
+        self.label_ids.get(label).copied()
     }
 }
 
@@ -1541,26 +1577,37 @@ impl<'a, C: PcodeLoweringContext + ?Sized> Planner<'a, C> {
         self.infer_local_sizes(ast);
         for statement in &ast.statements {
             match &statement.ty {
-                AstNode::Label(label) => self.plan.define_label(label),
+                AstNode::Label(label) => {
+                    self.plan.declare_label(label);
+                }
                 AstNode::Branch { target } | AstNode::ConditionalBranch { target, .. } => {
                     // A target this pass cannot resolve is left out; emission
                     // reports it with the error it would have reported before.
                     if let LabelOrNode::Expr(expr) = target
                         && let Some(address) = self.direct_address(expr)
-                        && !self.plan.direct_branches.contains(&address)
                     {
-                        self.plan.direct_branches.push(address);
+                        self.plan.declare_direct_branch(address);
                     }
                 }
                 AstNode::Call { target } => {
                     if let LabelOrNode::Expr(expr) = target
                         && let Some(address) = self.direct_address(expr)
-                        && !self.plan.direct_calls.contains(&address)
                     {
-                        self.plan.direct_calls.push(address);
+                        self.plan.declare_direct_call(address);
                     }
                 }
                 _ => {}
+            }
+        }
+
+        // Only labels may follow the last operation-producing statement, so
+        // the trailing run of labels is exactly the terminal one.
+        for statement in ast.statements.iter().rev() {
+            let AstNode::Label(label) = &statement.ty else {
+                break;
+            };
+            if let Some(id) = self.plan.label_id(label) {
+                self.plan.terminal[id.index()] = true;
             }
         }
     }
