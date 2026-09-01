@@ -6,9 +6,9 @@
 //! these operations by allocating temporaries in its unique space.
 
 use crate::{
-    Ast, AstNode, BinaryOperator, BitRangeFieldId, Builtin, Expression, ExpressionTy, Ident,
-    LabelOrNode, Load, LocalVarId, PCodeOpId, PcodeAst, Range, RangeParam, RegisterId, SPACE_CONST,
-    SpaceId, UnaryOperator,
+    Ast, AstNode, BinaryOperator, BitRangeFieldId, Builtin, Expression, ExpressionTy, FieldId,
+    Ident, LabelOrNode, Load, LocalVarId, PCodeOpId, PcodeAst, Range, RangeParam, RegisterId,
+    SPACE_CONST, SpaceId, TableId, UnaryOperator,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -604,6 +604,75 @@ pub fn plan_instruction(
     Ok(planner.plan)
 }
 
+/// A width in the domain a width-inference pass works over.
+///
+/// Per-instruction planning knows every width as a concrete byte count. A
+/// producer resolving its own source bodies does not: a body's local can take
+/// its width from a table operand whose export only exists once an instruction
+/// is decoded. Naming that dependency rather than dropping it is what makes
+/// the two passes agree — a pass that simply skipped the unknown would size
+/// the local from a *later* statement and reach a different answer.
+pub trait Width: Copy + Eq + std::fmt::Debug {
+    /// A concrete width in bytes.
+    fn fixed(size: usize) -> Self;
+
+    /// This width as a byte count, if it is concrete. Arithmetic on a width
+    /// uses this, so a symbolic width yields no constraint rather than a
+    /// wrong one.
+    fn size(self) -> Option<usize>;
+
+    /// The width of the value an operand supplies, if this domain can name
+    /// it. Concrete domains cannot, and report the width as unknown.
+    fn operand(_key: OperandKey) -> Option<Self> {
+        None
+    }
+}
+
+impl Width for usize {
+    fn fixed(size: usize) -> Self {
+        size
+    }
+
+    fn size(self) -> Option<usize> {
+        Some(self)
+    }
+}
+
+/// An operand whose value a decode substitutes into a p-code body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum OperandKey {
+    /// A sub-table operand, which supplies its constructor's exported value.
+    Table(TableId),
+    /// A decoder field, which supplies the constant this encoding gave it.
+    Field(FieldId),
+}
+
+/// A width resolved before decoding, which may still name an operand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SymbolicWidth {
+    /// A concrete width in bytes.
+    Fixed(usize),
+    /// The width of the value an operand supplies.
+    SameAs(OperandKey),
+}
+
+impl Width for SymbolicWidth {
+    fn fixed(size: usize) -> Self {
+        Self::Fixed(size)
+    }
+
+    fn size(self) -> Option<usize> {
+        match self {
+            Self::Fixed(size) => Some(size),
+            Self::SameAs(_) => None,
+        }
+    }
+
+    fn operand(key: OperandKey) -> Option<Self> {
+        Some(Self::SameAs(key))
+    }
+}
+
 /// Widths, in bytes, of the local variables of one p-code body.
 pub type LocalSizes = HashMap<LocalVarId, usize>;
 
@@ -618,16 +687,11 @@ pub type LocalSizes = HashMap<LocalVarId, usize>;
 /// A local absent from the result could not be sized from this body alone: its
 /// width comes from a value the producer substitutes into the body, so the
 /// producer must resolve it or fall back to [`plan_instruction`].
-pub fn infer_local_sizes<S>(
+pub fn infer_local_sizes<S, W: Width>(
     statements: &[Ast<S>],
     context: &impl PcodeLoweringContext,
-) -> LocalSizes {
-    let mut planner = Planner {
-        context,
-        plan: PcodePlan::default(),
-    };
-    planner.infer_local_sizes(statements);
-    planner.plan.local_sizes
+) -> HashMap<LocalVarId, W> {
+    SizeInference::run(context, statements)
 }
 
 /// Plans `ast` with local widths the producer has already resolved.
@@ -1625,7 +1689,7 @@ struct Planner<'a, C: PcodeLoweringContext + ?Sized> {
 
 impl<'a, C: PcodeLoweringContext + ?Sized> Planner<'a, C> {
     fn plan(&mut self, ast: &PcodeAst) {
-        self.infer_local_sizes(&ast.statements);
+        self.plan.local_sizes = SizeInference::run(self.context, &ast.statements);
         self.plan_statements(ast);
     }
 
@@ -1675,19 +1739,41 @@ impl<'a, C: PcodeLoweringContext + ?Sized> Planner<'a, C> {
             _ => None,
         }
     }
+}
 
-    /// Resolve local widths from their uses before emitting operations. A
-    /// forward-only allocator cannot size, for example, `v = 255 & 31` until a
-    /// later `word << v` reveals that `v` is a word-wide shift count.
-    fn infer_local_sizes<S>(&mut self, statements: &[Ast<S>]) {
+/// The width-inference pass, shared by specification-compile time and by
+/// per-instruction planning.
+///
+/// It is generic over the statement span so a producer can run it over its own
+/// *source* bodies, and over the width domain so those bodies can be resolved
+/// before the values a decode substitutes into them are known.
+struct SizeInference<'a, C: PcodeLoweringContext + ?Sized, W: Width> {
+    context: &'a C,
+    sizes: HashMap<LocalVarId, W>,
+}
+
+impl<'a, C: PcodeLoweringContext + ?Sized, W: Width> SizeInference<'a, C, W> {
+    fn run<S>(context: &'a C, statements: &[Ast<S>]) -> HashMap<LocalVarId, W> {
+        let mut inference = Self {
+            context,
+            sizes: HashMap::new(),
+        };
+        inference.infer(statements);
+        inference.sizes
+    }
+
+    /// Resolve local widths from their uses. A forward-only allocator cannot
+    /// size, for example, `v = 255 & 31` until a later `word << v` reveals
+    /// that `v` is a word-wide shift count.
+    fn infer<S>(&mut self, statements: &[Ast<S>]) {
         // Each pass can discover at least one previously unknown local. The
         // extra pass propagates that discovery through a chain of locals.
         for _ in 0..=statements.len() {
-            let before = self.plan.local_sizes.len();
+            let before = self.sizes.len();
             for statement in statements {
                 self.constrain_statement(&statement.ty);
             }
-            if self.plan.local_sizes.len() == before {
+            if self.sizes.len() == before {
                 break;
             }
         }
@@ -1703,38 +1789,42 @@ impl<'a, C: PcodeLoweringContext + ?Sized> Planner<'a, C> {
                     matches!(&rhs.ty, ExpressionTy::Binop(binop) if binop.op.is_comparison())
                         .then_some(rhs.size)
                         .flatten()
-                        .filter(|&size| size != 1);
+                        .filter(|&size| size != 1)
+                        .map(W::fixed);
                 let expected = (*size)
+                    .map(W::fixed)
                     .or_else(|| self.storage_size(lhs))
                     .or(comparison_size);
                 let inferred = self.constrain_expr(rhs, expected);
                 if let Ident::Named(id) = lhs
                     && let Some(size) = expected.or(inferred)
                 {
-                    self.plan.local_sizes.entry(*id).or_insert(size);
+                    self.sizes.entry(*id).or_insert(size);
                 }
             }
             AstNode::LoadAssignment { lhs, rhs, .. } => {
                 let space = self.load_space(lhs).ok();
                 if let Some(space) = space {
-                    self.constrain_expr(&lhs.ptr, self.context.address_size(space));
+                    self.constrain_expr(&lhs.ptr, self.context.address_size(space).map(W::fixed));
                 }
-                self.constrain_expr(rhs, lhs.size);
+                self.constrain_expr(rhs, lhs.size.map(W::fixed));
             }
             AstNode::RangeAssignment { lhs, rhs, .. } => {
                 if let Ok((_, bits)) = range_params(lhs) {
-                    self.constrain_expr(rhs, Some(bits.div_ceil(8)));
+                    self.constrain_expr(rhs, Some(W::fixed(bits.div_ceil(8))));
                 }
             }
             AstNode::ConditionalBranch { condition, .. } => {
-                self.constrain_expr(condition, Some(1));
+                self.constrain_expr(condition, Some(W::fixed(1)));
             }
             AstNode::BranchIndirect { target }
             | AstNode::CallIndirect { target }
             | AstNode::Return { target } => {
                 self.constrain_expr(
                     target,
-                    self.context.address_size(self.context.default_space()),
+                    self.context
+                        .address_size(self.context.default_space())
+                        .map(W::fixed),
                 );
             }
             AstNode::Expression(expr) => {
@@ -1753,18 +1843,14 @@ impl<'a, C: PcodeLoweringContext + ?Sized> Planner<'a, C> {
     /// Applies an optional consumer width to `expr` and returns any concrete
     /// output width known after that constraint. Integer literals intentionally
     /// do not establish a width on their own.
-    fn constrain_expr<S>(
-        &mut self,
-        expr: &Expression<S>,
-        expected: Option<usize>,
-    ) -> Option<usize> {
+    fn constrain_expr<S>(&mut self, expr: &Expression<S>, expected: Option<W>) -> Option<W> {
         match &expr.ty {
             ExpressionTy::SizedInt { .. } => expected,
             ExpressionTy::Ident(Ident::Named(id)) => {
-                if let Some(&size) = self.plan.local_sizes.get(id) {
+                if let Some(&size) = self.sizes.get(id) {
                     Some(size)
                 } else if let Some(size) = expected {
-                    self.plan.local_sizes.insert(*id, size);
+                    self.sizes.insert(*id, size);
                     Some(size)
                 } else {
                     None
@@ -1773,22 +1859,28 @@ impl<'a, C: PcodeLoweringContext + ?Sized> Planner<'a, C> {
             ExpressionTy::Ident(ident) => self.storage_size(ident),
             ExpressionTy::Load(load) => {
                 if let Ok(space) = self.load_space(load) {
-                    self.constrain_expr(&load.ptr, self.context.address_size(space));
+                    self.constrain_expr(&load.ptr, self.context.address_size(space).map(W::fixed));
                 }
-                load.size.or(expected)
+                load.size.map(W::fixed).or(expected)
             }
             ExpressionTy::SubPieceLsb { src, count } => {
                 self.constrain_expr(src, None);
-                Some(*count)
+                Some(W::fixed(*count))
             }
             ExpressionTy::SubPieceMsb { src, count } => {
-                let size = expected.or_else(|| self.expr_size(src)?.checked_sub(*count));
-                self.constrain_expr(src, size.map(|size| size + count));
+                // Truncation is arithmetic on a width, so a still-symbolic
+                // operand width yields no constraint rather than a wrong one.
+                let size = expected
+                    .or_else(|| Some(W::fixed(self.expr_size(src)?.size()?.checked_sub(*count)?)));
+                let source = size
+                    .and_then(|size| size.size())
+                    .map(|size| W::fixed(size + count));
+                self.constrain_expr(src, source);
                 size
             }
             ExpressionTy::Range(range) => {
                 let size = match range.size {
-                    RangeParam::Literal(bits) => Some(bits.div_ceil(8)),
+                    RangeParam::Literal(bits) => Some(W::fixed(bits.div_ceil(8))),
                     RangeParam::MacroArg(_) => expected,
                 };
                 self.constrain_expr(&range.value, None);
@@ -1799,7 +1891,7 @@ impl<'a, C: PcodeLoweringContext + ?Sized> Planner<'a, C> {
                     builtin,
                     Builtin::Carry | Builtin::Scarry | Builtin::Sborrow | Builtin::Nan
                 );
-                let size = boolean.then_some(1).or(expected);
+                let size = boolean.then(|| W::fixed(1)).or(expected);
                 let input_size = args.iter().find_map(|arg| self.constrain_expr(arg, None));
                 if let Some(input_size) = input_size {
                     for arg in args {
@@ -1818,11 +1910,12 @@ impl<'a, C: PcodeLoweringContext + ?Sized> Planner<'a, C> {
                 UnaryOperator::LogicalNot => {
                     let size = self.constrain_expr(&unop.e, None);
                     self.constrain_expr(&unop.e, size);
-                    Some(1)
+                    Some(W::fixed(1))
                 }
-                UnaryOperator::AddressOf(size) => size.or_else(|| {
+                UnaryOperator::AddressOf(size) => size.map(W::fixed).or_else(|| {
                     self.storage_from_expr_size(&unop.e)
                         .and_then(|storage| self.context.address_size(storage.space))
+                        .map(W::fixed)
                 }),
                 _ => {
                     let size = expected.or_else(|| self.constrain_expr(&unop.e, None));
@@ -1848,26 +1941,32 @@ impl<'a, C: PcodeLoweringContext + ?Sized> Planner<'a, C> {
                 };
                 self.constrain_expr(&binop.lhs, input_size);
                 self.constrain_expr(&binop.rhs, input_size);
-                if boolean { Some(1) } else { input_size }
+                if boolean {
+                    Some(W::fixed(1))
+                } else {
+                    input_size
+                }
             }
             ExpressionTy::MacroCall { .. } | ExpressionTy::DeferredCall { .. } => expected,
         }
     }
 }
 
-impl<'a, C: PcodeLoweringContext + ?Sized> Sizing for Planner<'a, C> {
+impl<'a, C: PcodeLoweringContext + ?Sized, W: Width> Sizing<W> for SizeInference<'a, C, W> {
     type Ctx = C;
 
     fn context(&self) -> &C {
         self.context
     }
 
-    fn local_size(&self, id: &LocalVarId) -> Option<usize> {
-        self.plan.local_sizes.get(id).copied()
+    fn local_size(&self, id: &LocalVarId) -> Option<W> {
+        self.sizes.get(id).copied()
     }
 }
 
-impl<C: PcodeLoweringContext + ?Sized, S: PcodeSink + ?Sized> Sizing for Lowerer<'_, '_, '_, C, S> {
+impl<C: PcodeLoweringContext + ?Sized, S: PcodeSink + ?Sized> Sizing<usize>
+    for Lowerer<'_, '_, '_, C, S>
+{
     type Ctx = C;
 
     fn context(&self) -> &C {
@@ -1886,36 +1985,27 @@ impl<C: PcodeLoweringContext + ?Sized, S: PcodeSink + ?Sized> Sizing for Lowerer
 /// Width and space queries shared by planning and emission. Both phases must
 /// answer them identically, so they have one implementation parameterized by
 /// how each phase knows a local's width.
-trait Sizing {
+trait Sizing<W: Width> {
     type Ctx: PcodeLoweringContext + ?Sized;
 
     fn context(&self) -> &Self::Ctx;
 
     /// The width of a local variable, if it is known in this phase.
-    fn local_size(&self, id: &LocalVarId) -> Option<usize>;
+    fn local_size(&self, id: &LocalVarId) -> Option<W>;
 
-    fn expr_size<S>(&self, expr: &Expression<S>) -> Option<usize> {
-        expr.size.or(match &expr.ty {
-            ExpressionTy::SizedInt { size, .. } => *size,
-            ExpressionTy::Ident(Ident::Register(id)) => self
-                .context()
-                .register_varnode(*id)
-                .map(|varnode| varnode.size),
-            ExpressionTy::Ident(Ident::BitRange(id)) => self
-                .context()
-                .bitrange_info(*id)
-                .map(|info| info.size.div_ceil(8)),
-            ExpressionTy::Ident(Ident::Named(id)) => self.local_size(id),
-            ExpressionTy::Ident(Ident::Field(_))
-            | ExpressionTy::Ident(Ident::Table(_))
-            | ExpressionTy::Ident(Ident::Global(_)) => None,
-            ExpressionTy::Load(load) => load.size,
-            ExpressionTy::SubPieceLsb { count, .. } => Some(*count),
-            ExpressionTy::SubPieceMsb { src, count } => self.expr_size(src)?.checked_sub(*count),
+    fn expr_size<S>(&self, expr: &Expression<S>) -> Option<W> {
+        expr.size.map(W::fixed).or(match &expr.ty {
+            ExpressionTy::SizedInt { size, .. } => size.map(W::fixed),
+            ExpressionTy::Ident(ident) => self.storage_size(ident),
+            ExpressionTy::Load(load) => load.size.map(W::fixed),
+            ExpressionTy::SubPieceLsb { count, .. } => Some(W::fixed(*count)),
+            ExpressionTy::SubPieceMsb { src, count } => {
+                Some(W::fixed(self.expr_size(src)?.size()?.checked_sub(*count)?))
+            }
             ExpressionTy::Range(Range {
                 size: RangeParam::Literal(bits),
                 ..
-            }) => Some(bits.div_ceil(8)),
+            }) => Some(W::fixed(bits.div_ceil(8))),
             ExpressionTy::Range(Range {
                 size: RangeParam::MacroArg(_),
                 ..
@@ -1923,11 +2013,11 @@ trait Sizing {
             ExpressionTy::FunctionCall {
                 builtin: Builtin::Carry | Builtin::Scarry | Builtin::Sborrow | Builtin::Nan,
                 ..
-            } => Some(1),
+            } => Some(W::fixed(1)),
             ExpressionTy::FunctionCall { .. } => None,
-            ExpressionTy::Unop(unop) if unop.op == UnaryOperator::LogicalNot => Some(1),
+            ExpressionTy::Unop(unop) if unop.op == UnaryOperator::LogicalNot => Some(W::fixed(1)),
             ExpressionTy::Unop(unop) => self.expr_size(&unop.e),
-            ExpressionTy::Binop(binop) if binop.op.is_comparison() => Some(1),
+            ExpressionTy::Binop(binop) if binop.op.is_comparison() => Some(W::fixed(1)),
             ExpressionTy::Binop(binop) => self
                 .expr_size(&binop.lhs)
                 .or_else(|| self.expr_size(&binop.rhs)),
@@ -1937,18 +2027,22 @@ trait Sizing {
         })
     }
 
-    fn storage_size(&self, ident: &Ident) -> Option<usize> {
+    fn storage_size(&self, ident: &Ident) -> Option<W> {
         match ident {
             Ident::Register(id) => self
                 .context()
                 .register_varnode(*id)
-                .map(|varnode| varnode.size),
+                .map(|varnode| W::fixed(varnode.size)),
             Ident::BitRange(id) => self
                 .context()
                 .bitrange_info(*id)
-                .map(|info| info.size.div_ceil(8)),
+                .map(|info| W::fixed(info.size.div_ceil(8))),
             Ident::Named(id) => self.local_size(id),
-            Ident::Field(_) | Ident::Table(_) | Ident::Global(_) => None,
+            // An operand's width is only known once a decode substitutes its
+            // value. A symbolic domain names it instead of losing it.
+            Ident::Table(id) => W::operand(OperandKey::Table(*id)),
+            Ident::Field(id) => W::operand(OperandKey::Field(*id)),
+            Ident::Global(_) => None,
         }
     }
 
@@ -2029,14 +2123,16 @@ fn binary_opcode(op: BinaryOperator) -> (Opcode, bool) {
 #[cfg(test)]
 mod tests {
     use super::{
-        BitRangeInfo, InstructionPcode, LabelId, Opcode, PcodeLowerError, PcodeLoweringContext,
-        PcodeOp, PcodeSink, Varnode, emit_instruction, lower_instruction, plan_instruction,
+        BitRangeInfo, InstructionPcode, LabelId, LocalSizes, Opcode, PcodeLowerError,
+        PcodeLoweringContext, PcodeOp, PcodeSink, Varnode, emit_instruction, lower_instruction,
+        plan_instruction,
     };
     use crate::{
         Ast, AstNode, BinaryOperator, Binop, Expression, ExpressionTy, Ident, LabelOrNode, Load,
         LocalVarId, PCodeOpId, PcodeAst, PcodeSpaceRef, Range, RangeParam, RegisterId, SPACE_CONST,
         SpaceId,
     };
+    use std::collections::HashMap;
 
     struct Context;
 
@@ -2305,6 +2401,57 @@ mod tests {
             pcode.ops[0].output,
             Some(Varnode::new(SpaceId::new(2), 0, 4))
         );
+    }
+
+    /// A width taken from a table operand must be *named*, not dropped: a
+    /// pass that dropped it would size the local from the later statement and
+    /// disagree with the per-instruction planner, which sees the substituted
+    /// value first.
+    #[test]
+    fn symbolic_inference_names_an_operand_width_instead_of_losing_it() {
+        let table = crate::TableId::new(7);
+        let statements = ast(vec![
+            AstNode::Assignment {
+                lhs: Ident::Named(LocalVarId(0)),
+                size: None,
+                rhs: Expression {
+                    ty: ExpressionTy::Ident(Ident::Table(table)),
+                    size: None,
+                    span: (),
+                },
+            },
+            AstNode::Assignment {
+                lhs: Ident::Register(RegisterId::new(1)),
+                size: None,
+                rhs: Expression {
+                    ty: ExpressionTy::Binop(Binop {
+                        op: BinaryOperator::Add,
+                        lhs: Box::new(
+                            ExpressionTy::Ident(Ident::Named(LocalVarId(0))).with_size(4),
+                        ),
+                        rhs: Box::new(ident(RegisterId::new(2))),
+                    }),
+                    size: None,
+                    span: (),
+                },
+            },
+        ])
+        .statements;
+
+        let symbolic: HashMap<LocalVarId, super::SymbolicWidth> =
+            super::infer_local_sizes(&statements, &Context);
+        assert_eq!(
+            symbolic.get(&LocalVarId(0)),
+            Some(&super::SymbolicWidth::SameAs(super::OperandKey::Table(
+                table
+            )))
+        );
+
+        // The concrete domain cannot name it, so it falls through to the
+        // later use — which is exactly the disagreement the symbolic domain
+        // exists to prevent.
+        let concrete: LocalSizes = super::infer_local_sizes(&statements, &Context);
+        assert_eq!(concrete.get(&LocalVarId(0)), Some(&4));
     }
 
     #[test]
