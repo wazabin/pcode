@@ -1006,15 +1006,18 @@ impl<'a, C: PcodeLoweringContext + ?Sized> Lowerer<'a, C> {
         // context required by a nested `zext`; carry the first operand's width
         // into the remaining operands instead.
         let inputs = if matches!(builtin, Builtin::Carry | Builtin::Scarry | Builtin::Sborrow)
-            && let Some((first, rest)) = args.split_first()
+            && !args.is_empty()
         {
-            let first = self.lower_expr(first, None)?;
-            let mut inputs = Vec::with_capacity(args.len());
-            inputs.push(first);
-            for arg in rest {
-                inputs.push(self.lower_expr_with_size(arg, first.size)?);
-            }
-            inputs
+            // The first operand can be an unsized literal (`sborrow(0, RAX)`
+            // in x86 `NEG`). Carry-family operands must all have the same
+            // width, so derive it from any concrete operand before lowering.
+            let operand_size = args
+                .iter()
+                .find_map(|arg| self.expr_size(arg))
+                .ok_or(PcodeLowerError::UnknownSize)?;
+            args.iter()
+                .map(|arg| self.lower_expr_with_size(arg, operand_size))
+                .collect::<Result<Vec<_>, _>>()?
         } else {
             args.iter()
                 .map(|arg| self.lower_expr(arg, None))
@@ -1032,10 +1035,8 @@ impl<'a, C: PcodeLoweringContext + ?Sized> Lowerer<'a, C> {
         requested_output: Option<Varnode>,
     ) -> Result<Varnode, PcodeLowerError> {
         if let UnaryOperator::AddressOf(size) = op {
-            // Address-of folds at disassembly time and emits no p-code, so it
-            // needs a symbol with a static address. An address symbol such as
-            // `inst_next` already *is* that address; taking its address only
-            // fixes the width.
+            // An address symbol such as `inst_next` already *is* its address;
+            // taking its address only fixes the width.
             if let ExpressionTy::SizedInt {
                 value,
                 size: literal_size,
@@ -1045,8 +1046,7 @@ impl<'a, C: PcodeLoweringContext + ?Sized> Lowerer<'a, C> {
                     .or(*literal_size)
                     .or(operand.size)
                     .ok_or(PcodeLowerError::UnknownSize)?;
-                return self
-                    .copy_if_requested(Varnode::constant(*value, size), requested_output);
+                return self.copy_if_requested(Varnode::constant(*value, size), requested_output);
             }
             let storage = self.storage_from_expr(operand)?;
             let size = size
@@ -1062,12 +1062,24 @@ impl<'a, C: PcodeLoweringContext + ?Sized> Lowerer<'a, C> {
             UnaryOperator::FloatMinus => Opcode::FloatNeg,
             UnaryOperator::AddressOf(_) => unreachable!(),
         };
-        let input = self.lower_expr(operand, None)?;
+        // Unsized integer literals are polymorphic. Resolve the unary result
+        // width before lowering its operand so `~8` can inherit the width of
+        // its assignment (for example x86 `CLTS`), rather than failing while
+        // lowering the literal without a consumer.
         let size = requested_output
             .map(|output| output.size)
             .or(expr.size)
             .or_else(|| (op == UnaryOperator::LogicalNot).then_some(1))
+            .or_else(|| self.expr_size(operand))
             .ok_or(PcodeLowerError::UnknownSize)?;
+        // Preserve a concrete operand's native width (notably BOOL_NEGATE,
+        // whose input need not be one byte); only force the result width into
+        // a width-less operand such as an integer literal.
+        let input = if self.expr_size(operand).is_some() {
+            self.lower_expr(operand, None)?
+        } else {
+            self.lower_expr_with_size(operand, size)?
+        };
         let output = self.output(requested_output, size)?;
         self.ops
             .push(PcodeOp::new(opcode, Some(output), vec![input]));
@@ -1242,9 +1254,87 @@ impl<'a, C: PcodeLoweringContext + ?Sized> Lowerer<'a, C> {
         range: &Range,
         rhs: &Expression,
     ) -> Result<(), PcodeLowerError> {
+        if let ExpressionTy::Load(load) = &range.value.ty {
+            return self.lower_load_range_assignment(load, range, rhs);
+        }
         let storage = self.storage_from_expr(&range.value)?;
         let (start, bits) = Self::range_params(range)?;
         self.insert_range(storage, start, bits, rhs)
+    }
+
+    /// Lowers a bit-range write into a memory load as load/modify/store. SLEIGH
+    /// uses this form for packed MMX lanes backed by private RAM, where an
+    /// address-of expression cannot name a raw-p-code varnode directly.
+    fn lower_load_range_assignment(
+        &mut self,
+        load: &Load,
+        range: &Range,
+        rhs: &Expression,
+    ) -> Result<(), PcodeLowerError> {
+        let storage = self.lower_load(&range.value, load, None)?;
+        let (start, bits) = Self::range_params(range)?;
+        Self::validate_range(storage, start, bits)?;
+        if storage.size > 8 {
+            return Err(PcodeLowerError::InvalidRange {
+                start,
+                size: bits,
+                storage_bits: storage.size.saturating_mul(8),
+            });
+        }
+        let value = self.lower_expr_with_size(rhs, bits.div_ceil(8))?;
+        if value.size > storage.size {
+            return Err(PcodeLowerError::InputSizeMismatch {
+                operation: "bit-range assignment",
+                left: storage.size,
+                right: value.size,
+            });
+        }
+        let extended = if value.size == storage.size {
+            value
+        } else {
+            let output = self.allocate_unique(storage.size)?;
+            self.ops
+                .push(PcodeOp::new(Opcode::IntZext, Some(output), vec![value]));
+            output
+        };
+        let inserted = self.allocate_unique(storage.size)?;
+        self.ops.push(PcodeOp::new(
+            Opcode::IntAnd,
+            Some(inserted),
+            vec![extended, Varnode::constant(Self::mask(bits)?, storage.size)],
+        ));
+        let shifted = self.allocate_unique(storage.size)?;
+        self.ops.push(PcodeOp::new(
+            Opcode::IntLeft,
+            Some(shifted),
+            vec![inserted, Varnode::constant(start as u64, storage.size)],
+        ));
+        let clear_mask = !(Self::mask(bits)? << start);
+        let kept = self.allocate_unique(storage.size)?;
+        self.ops.push(PcodeOp::new(
+            Opcode::IntAnd,
+            Some(kept),
+            vec![storage, Varnode::constant(clear_mask, storage.size)],
+        ));
+        let result = self.allocate_unique(storage.size)?;
+        self.ops.push(PcodeOp::new(
+            Opcode::IntOr,
+            Some(result),
+            vec![kept, shifted],
+        ));
+
+        let space = self.load_space(load)?;
+        if space == SPACE_CONST {
+            return Err(PcodeLowerError::Unsupported("a store to constant space"));
+        }
+        let ptr = self.lower_expr(&load.ptr, None)?;
+        self.validate_pointer(space, ptr)?;
+        self.ops.push(PcodeOp::new(
+            Opcode::Store,
+            None,
+            vec![Self::space_id(space), ptr, result],
+        ));
+        Ok(())
     }
 
     fn insert_range(
@@ -1519,9 +1609,11 @@ impl<'a, C: PcodeLoweringContext + ?Sized> Lowerer<'a, C> {
                 .context
                 .bitrange_info(*id)
                 .map(|info| info.size.div_ceil(8)),
-            ExpressionTy::Ident(Ident::Named(id)) => {
-                self.locals.get(id).map(|varnode| varnode.size)
-            }
+            ExpressionTy::Ident(Ident::Named(id)) => self
+                .local_sizes
+                .get(id)
+                .copied()
+                .or_else(|| self.locals.get(id).map(|varnode| varnode.size)),
             ExpressionTy::Ident(Ident::Field(_))
             | ExpressionTy::Ident(Ident::Table(_))
             | ExpressionTy::Ident(Ident::Global(_)) => None,
