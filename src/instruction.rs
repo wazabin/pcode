@@ -6,7 +6,7 @@
 //! these operations by allocating temporaries in its unique space.
 
 use crate::{
-    AstNode, BinaryOperator, BitRangeFieldId, Builtin, Expression, ExpressionTy, Ident,
+    Ast, AstNode, BinaryOperator, BitRangeFieldId, Builtin, Expression, ExpressionTy, Ident,
     LabelOrNode, Load, LocalVarId, PCodeOpId, PcodeAst, Range, RangeParam, RegisterId, SPACE_CONST,
     SpaceId, UnaryOperator,
 };
@@ -601,6 +601,53 @@ pub fn plan_instruction(
         plan: PcodePlan::default(),
     };
     planner.plan(ast);
+    Ok(planner.plan)
+}
+
+/// Widths, in bytes, of the local variables of one p-code body.
+pub type LocalSizes = HashMap<LocalVarId, usize>;
+
+/// Infers the local-variable widths of a *source* p-code body.
+///
+/// This is the same inference [`plan_instruction`] runs per decoded
+/// instruction, exposed so a producer can resolve widths once per body at
+/// specification-compile time — reporting an unsizable local as a compile
+/// error rather than an `UnknownSize` at lift time, and leaving nothing for
+/// the per-instruction planner to iterate.
+///
+/// A local absent from the result could not be sized from this body alone: its
+/// width comes from a value the producer substitutes into the body, so the
+/// producer must resolve it or fall back to [`plan_instruction`].
+pub fn infer_local_sizes<S>(
+    statements: &[Ast<S>],
+    context: &impl PcodeLoweringContext,
+) -> LocalSizes {
+    let mut planner = Planner {
+        context,
+        plan: PcodePlan::default(),
+    };
+    planner.infer_local_sizes(statements);
+    planner.plan.local_sizes
+}
+
+/// Plans `ast` with local widths the producer has already resolved.
+///
+/// The caller guarantees `local_sizes` covers every local the body uses; a
+/// missing width is an `UnknownSize` error at emission, exactly as it is when
+/// the per-instruction inference cannot resolve one.
+pub fn plan_instruction_with(
+    ast: &PcodeAst,
+    context: &impl PcodeLoweringContext,
+    local_sizes: LocalSizes,
+) -> Result<PcodePlan, PcodeLowerError> {
+    let mut planner = Planner {
+        context,
+        plan: PcodePlan {
+            local_sizes,
+            ..PcodePlan::default()
+        },
+    };
+    planner.plan_statements(ast);
     Ok(planner.plan)
 }
 
@@ -1567,6 +1614,10 @@ impl<'a, 'p, 's, C: PcodeLoweringContext + ?Sized, S: PcodeSink + ?Sized>
 }
 
 /// The read-only pass which produces a [`PcodePlan`].
+///
+/// It is generic over the statement span so a producer can run the same width
+/// inference over its own *source* bodies, before any instruction is decoded,
+/// rather than keeping a second implementation that can drift from this one.
 struct Planner<'a, C: PcodeLoweringContext + ?Sized> {
     context: &'a C,
     plan: PcodePlan,
@@ -1574,7 +1625,13 @@ struct Planner<'a, C: PcodeLoweringContext + ?Sized> {
 
 impl<'a, C: PcodeLoweringContext + ?Sized> Planner<'a, C> {
     fn plan(&mut self, ast: &PcodeAst) {
-        self.infer_local_sizes(ast);
+        self.infer_local_sizes(&ast.statements);
+        self.plan_statements(ast);
+    }
+
+    /// Collects the facts that do not depend on local widths: the labels and
+    /// the addresses this instruction reaches directly.
+    fn plan_statements(&mut self, ast: &PcodeAst) {
         for statement in &ast.statements {
             match &statement.ty {
                 AstNode::Label(label) => {
@@ -1612,7 +1669,7 @@ impl<'a, C: PcodeLoweringContext + ?Sized> Planner<'a, C> {
         }
     }
 
-    fn direct_address(&self, target: &Expression) -> Option<u64> {
+    fn direct_address<S>(&self, target: &Expression<S>) -> Option<u64> {
         match target.ty {
             ExpressionTy::SizedInt { value, .. } => Some(value),
             _ => None,
@@ -1622,12 +1679,12 @@ impl<'a, C: PcodeLoweringContext + ?Sized> Planner<'a, C> {
     /// Resolve local widths from their uses before emitting operations. A
     /// forward-only allocator cannot size, for example, `v = 255 & 31` until a
     /// later `word << v` reveals that `v` is a word-wide shift count.
-    fn infer_local_sizes(&mut self, ast: &PcodeAst) {
+    fn infer_local_sizes<S>(&mut self, statements: &[Ast<S>]) {
         // Each pass can discover at least one previously unknown local. The
         // extra pass propagates that discovery through a chain of locals.
-        for _ in 0..=ast.statements.len() {
+        for _ in 0..=statements.len() {
             let before = self.plan.local_sizes.len();
-            for statement in &ast.statements {
+            for statement in statements {
                 self.constrain_statement(&statement.ty);
             }
             if self.plan.local_sizes.len() == before {
@@ -1636,7 +1693,7 @@ impl<'a, C: PcodeLoweringContext + ?Sized> Planner<'a, C> {
         }
     }
 
-    fn constrain_statement(&mut self, statement: &AstNode) {
+    fn constrain_statement<S>(&mut self, statement: &AstNode<S>) {
         match statement {
             AstNode::Assignment { lhs, size, rhs } => {
                 // Comparisons normally infer a one-byte result. A different
@@ -1696,7 +1753,11 @@ impl<'a, C: PcodeLoweringContext + ?Sized> Planner<'a, C> {
     /// Applies an optional consumer width to `expr` and returns any concrete
     /// output width known after that constraint. Integer literals intentionally
     /// do not establish a width on their own.
-    fn constrain_expr(&mut self, expr: &Expression, expected: Option<usize>) -> Option<usize> {
+    fn constrain_expr<S>(
+        &mut self,
+        expr: &Expression<S>,
+        expected: Option<usize>,
+    ) -> Option<usize> {
         match &expr.ty {
             ExpressionTy::SizedInt { .. } => expected,
             ExpressionTy::Ident(Ident::Named(id)) => {
@@ -1833,7 +1894,7 @@ trait Sizing {
     /// The width of a local variable, if it is known in this phase.
     fn local_size(&self, id: &LocalVarId) -> Option<usize>;
 
-    fn expr_size(&self, expr: &Expression) -> Option<usize> {
+    fn expr_size<S>(&self, expr: &Expression<S>) -> Option<usize> {
         expr.size.or(match &expr.ty {
             ExpressionTy::SizedInt { size, .. } => *size,
             ExpressionTy::Ident(Ident::Register(id)) => self
@@ -1891,7 +1952,7 @@ trait Sizing {
         }
     }
 
-    fn storage_from_expr_size(&self, expr: &Expression) -> Option<Varnode> {
+    fn storage_from_expr_size<S>(&self, expr: &Expression<S>) -> Option<Varnode> {
         match &expr.ty {
             ExpressionTy::Ident(Ident::Register(id)) => self.context().register_varnode(*id),
             ExpressionTy::Ident(Ident::BitRange(id)) => {
@@ -1901,7 +1962,7 @@ trait Sizing {
         }
     }
 
-    fn load_space(&self, load: &Load) -> Result<SpaceId, PcodeLowerError> {
+    fn load_space<S>(&self, load: &Load<S>) -> Result<SpaceId, PcodeLowerError> {
         match &load.space {
             None => Ok(self.context().default_space()),
             Some(crate::PcodeSpaceRef::Resolved(space)) => Ok(*space),
@@ -1913,7 +1974,7 @@ trait Sizing {
 /// Reads a bit range's literal start and width.
 ///
 /// A macro-argument range must have been substituted during expansion.
-fn range_params(range: &Range) -> Result<(usize, usize), PcodeLowerError> {
+fn range_params<S>(range: &Range<S>) -> Result<(usize, usize), PcodeLowerError> {
     let RangeParam::Literal(start) = range.start else {
         return Err(PcodeLowerError::UnresolvedRangeParameter);
     };
@@ -2210,6 +2271,40 @@ mod tests {
                 rhs: ident(RegisterId::new(2)),
             },
         ]
+    }
+
+    #[test]
+    fn local_widths_can_be_inferred_from_a_body_before_planning() {
+        let statements = vec![
+            AstNode::Assignment {
+                lhs: Ident::Named(LocalVarId(0)),
+                size: None,
+                rhs: ident(RegisterId::new(1)),
+            },
+            AstNode::Assignment {
+                lhs: Ident::Register(RegisterId::new(2)),
+                size: None,
+                rhs: ExpressionTy::Ident(Ident::Named(LocalVarId(0))).with_size(4),
+            },
+        ];
+        let ast = ast(statements.clone());
+
+        // The same widths whether resolved from the body up front or by the
+        // per-instruction planner.
+        let sizes = super::infer_local_sizes(&ast.statements, &Context);
+        assert_eq!(sizes.get(&LocalVarId(0)), Some(&4));
+
+        let planned = super::plan_instruction_with(&ast, &Context, sizes).unwrap();
+        let inferred = plan_instruction(&ast, &Context).unwrap();
+        assert_eq!(planned.labels(), inferred.labels());
+
+        // And supplied widths reach emission: the local becomes a 4-byte
+        // unique, not an unsized-local error.
+        let pcode = lower_instruction(&ast, &Context).unwrap();
+        assert_eq!(
+            pcode.ops[0].output,
+            Some(Varnode::new(SpaceId::new(2), 0, 4))
+        );
     }
 
     #[test]
