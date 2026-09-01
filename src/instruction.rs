@@ -11,7 +11,10 @@ use crate::{
     SpaceId, UnaryOperator,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, fmt};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+};
 
 /// A storage location or constant used as an input or output of a p-code op.
 ///
@@ -416,6 +419,169 @@ impl fmt::Display for PcodeLowerError {
 
 impl std::error::Error for PcodeLowerError {}
 
+/// Identifies one instruction-local p-code label.
+///
+/// A streaming emitter cannot know the operation index of a forward label, so
+/// labels reach a [`PcodeSink`] symbolically. Identifiers are assigned in the
+/// order the AST defines the labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LabelId(u32);
+
+impl LabelId {
+    /// Returns this label's index, which is stable within one [`PcodePlan`].
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// Whole-instruction facts a consumer needs before p-code emission starts.
+///
+/// Planning is a read-only pass over the expanded AST. It exists so a consumer
+/// can prepare instruction-wide state — out-of-instruction branch and call
+/// destinations, instruction-local labels — without a flat p-code vector to
+/// re-scan.
+#[derive(Debug, Clone, Default)]
+pub struct PcodePlan {
+    /// Local widths resolved from their uses, needed before a forward-only
+    /// emitter can allocate a local's temporary.
+    local_sizes: HashMap<LocalVarId, usize>,
+    labels: Vec<Box<str>>,
+    label_ids: HashMap<Box<str>, LabelId>,
+    direct_branches: Vec<u64>,
+    direct_calls: Vec<u64>,
+}
+
+impl PcodePlan {
+    /// Names of the instruction-local labels, indexed by [`LabelId::index`].
+    pub fn labels(&self) -> &[Box<str>] {
+        &self.labels
+    }
+
+    /// Addresses this instruction can reach with a direct branch.
+    pub fn direct_branches(&self) -> &[u64] {
+        &self.direct_branches
+    }
+
+    /// Addresses this instruction can reach with a direct call.
+    pub fn direct_calls(&self) -> &[u64] {
+        &self.direct_calls
+    }
+
+    fn label_id(&self, label: &str) -> Option<LabelId> {
+        self.label_ids.get(label).copied()
+    }
+
+    fn define_label(&mut self, label: &str) {
+        if self.label_ids.contains_key(label) {
+            // A duplicate definition is an emission-time error, reported with
+            // the label's name; planning keeps one identifier per name.
+            return;
+        }
+        let id = LabelId(self.labels.len() as u32);
+        self.labels.push(Box::from(label));
+        self.label_ids.insert(Box::from(label), id);
+    }
+}
+
+/// Receives resolved p-code operations as an instruction is emitted.
+///
+/// Operations arrive in execution order. Sinks are infallible: a consumer that
+/// can fail records its own error and ignores the rest of the instruction,
+/// because a partially emitted instruction is discarded by its caller.
+pub trait PcodeSink {
+    /// Receives one resolved operation. `inputs` is borrowed for the call
+    /// only, so a sink which needs to retain the operation must copy it.
+    fn op(&mut self, opcode: Opcode, output: Option<Varnode>, inputs: &[Varnode]);
+
+    /// Marks the position of an instruction-local label: the next operation
+    /// reported is its target.
+    fn label(&mut self, label: LabelId);
+
+    /// Receives a branch whose target is instruction-local. `opcode` is
+    /// [`Opcode::Branch`] or [`Opcode::CBranch`], and `condition` is present
+    /// exactly for the latter.
+    fn branch_label(&mut self, opcode: Opcode, label: LabelId, condition: Option<Varnode>);
+}
+
+/// The sink which reproduces [`InstructionPcode`]: it retains operations and
+/// resolves local branches into the relative constant targets raw p-code uses.
+#[derive(Debug, Default)]
+struct Collector {
+    ops: Vec<PcodeOp>,
+    label_ops: HashMap<LabelId, usize>,
+    fixups: Vec<(usize, LabelId)>,
+}
+
+impl Collector {
+    fn finish(mut self, plan: &PcodePlan) -> Result<Vec<PcodeOp>, PcodeLowerError> {
+        for (op_index, label) in &self.fixups {
+            let target = *self
+                .label_ops
+                .get(label)
+                .ok_or_else(|| PcodeLowerError::UnknownLabel(plan.labels[label.index()].clone()))?;
+            let relative = i64::try_from(target)
+                .ok()
+                .and_then(|target| {
+                    i64::try_from(*op_index)
+                        .ok()
+                        .and_then(|source| target.checked_sub(source))
+                })
+                .ok_or(PcodeLowerError::UniqueSpaceOverflow)?;
+            self.ops[*op_index].inputs[0] = Varnode::constant(relative as u64, 8);
+        }
+        Ok(self.ops)
+    }
+}
+
+impl PcodeSink for Collector {
+    fn op(&mut self, opcode: Opcode, output: Option<Varnode>, inputs: &[Varnode]) {
+        self.ops.push(PcodeOp::new(opcode, output, inputs.to_vec()));
+    }
+
+    fn label(&mut self, label: LabelId) {
+        self.label_ops.insert(label, self.ops.len());
+    }
+
+    fn branch_label(&mut self, opcode: Opcode, label: LabelId, condition: Option<Varnode>) {
+        let mut inputs = Vec::with_capacity(1 + usize::from(condition.is_some()));
+        inputs.push(Varnode::constant(0, 8));
+        inputs.extend(condition);
+        self.fixups.push((self.ops.len(), label));
+        self.ops.push(PcodeOp::new(opcode, None, inputs));
+    }
+}
+
+/// Collects the whole-instruction facts of `ast` without emitting p-code.
+///
+/// The plan is the shared contract between the p-code emitter and its
+/// consumer: it is produced from the same expanded AST that emission lowers,
+/// so a consumer never has to re-scan flat p-code to discover them.
+pub fn plan_instruction(
+    ast: &PcodeAst,
+    context: &impl PcodeLoweringContext,
+) -> Result<PcodePlan, PcodeLowerError> {
+    let mut planner = Planner {
+        context,
+        plan: PcodePlan::default(),
+    };
+    planner.plan(ast);
+    Ok(planner.plan)
+}
+
+/// Lowers `ast` and reports each resolved operation to `sink`.
+///
+/// `plan` must come from [`plan_instruction`] for the same AST and context.
+/// Unlike [`lower_instruction`], no operation vector is built: local branches
+/// are reported against the plan's labels rather than resolved offsets.
+pub fn emit_instruction(
+    ast: &PcodeAst,
+    context: &impl PcodeLoweringContext,
+    plan: &PcodePlan,
+    sink: &mut impl PcodeSink,
+) -> Result<(), PcodeLowerError> {
+    Lowerer::new(context, plan, sink).emit_all(ast)
+}
+
 /// Lowers a fully expanded source-shaped AST to Ghidra-style instruction p-code.
 ///
 /// The AST must be in consumer form: `build`, `export`, delay-slot, macro,
@@ -431,8 +597,18 @@ pub fn lower_instruction(
     context: &impl PcodeLoweringContext,
 ) -> Result<InstructionPcode, PcodeLowerError> {
     Ok(InstructionPcode {
-        ops: Lowerer::new(context).lower_ops(ast)?,
+        ops: collect_ops(ast, context)?,
     })
+}
+
+fn collect_ops(
+    ast: &PcodeAst,
+    context: &impl PcodeLoweringContext,
+) -> Result<Vec<PcodeOp>, PcodeLowerError> {
+    let plan = plan_instruction(ast, context)?;
+    let mut collector = Collector::default();
+    emit_instruction(ast, context, &plan, &mut collector)?;
+    collector.finish(&plan)
 }
 
 /// Lowers `ast` and exposes its resolved flat p-code to `sink` without
@@ -446,7 +622,7 @@ pub fn lower_instruction_into<R>(
     context: &impl PcodeLoweringContext,
     sink: impl FnOnce(&[PcodeOp]) -> R,
 ) -> Result<R, PcodeLowerError> {
-    let ops = Lowerer::new(context).lower_ops(ast)?;
+    let ops = collect_ops(ast, context)?;
     Ok(sink(&ops))
 }
 
@@ -460,39 +636,940 @@ impl InstructionPcode {
     }
 }
 
-struct Lowerer<'a, C: PcodeLoweringContext + ?Sized> {
+struct Lowerer<'a, 'p, 's, C: PcodeLoweringContext + ?Sized, S: PcodeSink + ?Sized> {
     context: &'a C,
-    ops: Vec<PcodeOp>,
+    plan: &'p PcodePlan,
+    sink: &'s mut S,
     locals: HashMap<LocalVarId, Varnode>,
-    /// Width constraints discovered before allocating local varnodes. SLEIGH
-    /// permits a local's producer to be width-less when a later consumer (such
-    /// as a shift or extension) supplies the only concrete width.
-    local_sizes: HashMap<LocalVarId, usize>,
-    labels: HashMap<Box<str>, usize>,
-    label_fixups: Vec<(usize, Box<str>)>,
+    defined_labels: HashSet<LabelId>,
     next_unique: u64,
 }
 
-impl<'a, C: PcodeLoweringContext + ?Sized> Lowerer<'a, C> {
-    fn new(context: &'a C) -> Self {
+impl<'a, 'p, 's, C: PcodeLoweringContext + ?Sized, S: PcodeSink + ?Sized>
+    Lowerer<'a, 'p, 's, C, S>
+{
+    fn new(context: &'a C, plan: &'p PcodePlan, sink: &'s mut S) -> Self {
         Self {
             context,
-            ops: Vec::new(),
+            plan,
+            sink,
             locals: HashMap::new(),
-            local_sizes: HashMap::new(),
-            labels: HashMap::new(),
-            label_fixups: Vec::new(),
+            defined_labels: HashSet::new(),
             next_unique: 0,
         }
     }
 
-    fn lower_ops(mut self, ast: &PcodeAst) -> Result<Vec<PcodeOp>, PcodeLowerError> {
-        self.infer_local_sizes(ast);
+    fn emit_all(mut self, ast: &PcodeAst) -> Result<(), PcodeLowerError> {
         for statement in &ast.statements {
             self.lower_statement(&statement.ty)?;
         }
-        self.resolve_labels()?;
-        Ok(self.ops)
+        Ok(())
+    }
+
+    fn emit(&mut self, opcode: Opcode, output: Option<Varnode>, inputs: &[Varnode]) {
+        self.sink.op(opcode, output, inputs);
+    }
+
+    fn lower_statement(&mut self, statement: &AstNode) -> Result<(), PcodeLowerError> {
+        match statement {
+            AstNode::Assignment {
+                lhs: Ident::BitRange(id),
+                rhs,
+                ..
+            } => {
+                let info = self
+                    .context
+                    .bitrange_info(*id)
+                    .ok_or(PcodeLowerError::Unsupported("an unknown named bit range"))?;
+                self.insert_range(info.storage, info.start, info.size, rhs)?;
+            }
+            AstNode::Assignment { lhs, size, rhs } => {
+                let output =
+                    self.storage_for_ident(lhs.clone(), size.or_else(|| self.expr_size(rhs)))?;
+                self.lower_expr(rhs, Some(output))?;
+            }
+            AstNode::LoadAssignment { lhs, rhs, .. } => self.lower_store(lhs, rhs)?,
+            AstNode::RangeAssignment { lhs, rhs, .. } => self.lower_range_assignment(lhs, rhs)?,
+            AstNode::Build(_) => return Err(PcodeLowerError::InternalNode("build statement")),
+            AstNode::DelaySlot(_) => {
+                return Err(PcodeLowerError::InternalNode("delay-slot directive"));
+            }
+            AstNode::DeferredBuild(_) => {
+                return Err(PcodeLowerError::InternalNode("deferred build statement"));
+            }
+            AstNode::Label(label) => {
+                let id = self.label_id(label)?;
+                if !self.defined_labels.insert(id) {
+                    return Err(PcodeLowerError::DuplicateLabel(label.clone()));
+                }
+                self.sink.label(id);
+            }
+            AstNode::Branch { target } => self.lower_direct_flow(Opcode::Branch, target, None)?,
+            AstNode::ConditionalBranch { condition, target } => {
+                let condition = self.lower_expr(condition, None)?;
+                self.lower_direct_flow(Opcode::CBranch, target, Some(condition))?;
+            }
+            AstNode::BranchIndirect { target } => {
+                self.lower_indirect_flow(Opcode::BranchInd, target)?
+            }
+            AstNode::Call { target } => self.lower_direct_flow(Opcode::Call, target, None)?,
+            AstNode::CallIndirect { target } => {
+                self.lower_indirect_flow(Opcode::CallInd, target)?
+            }
+            AstNode::Return { target } => self.lower_indirect_flow(Opcode::Return, target)?,
+            AstNode::Export(_) => return Err(PcodeLowerError::InternalNode("export statement")),
+            AstNode::Expression(expr) => self.lower_effect(expr)?,
+        }
+        Ok(())
+    }
+
+    fn lower_store(&mut self, load: &Load, rhs: &Expression) -> Result<(), PcodeLowerError> {
+        let space = self.load_space(load)?;
+        if space == SPACE_CONST {
+            return Err(PcodeLowerError::Unsupported("a store to constant space"));
+        }
+        let ptr = self.lower_expr(&load.ptr, None)?;
+        self.validate_pointer(space, ptr)?;
+        let value = match load.size {
+            Some(size) => self.lower_expr_with_size(rhs, size)?,
+            None => self.lower_expr(rhs, None)?,
+        };
+        if let Some(size) = load.size {
+            Self::checked_size(size)?;
+            if size != value.size {
+                return Err(PcodeLowerError::StoreSizeMismatch {
+                    declared: size,
+                    value: value.size,
+                });
+            }
+        }
+        self.emit(Opcode::Store, None, &[Self::space_id(space), ptr, value]);
+        Ok(())
+    }
+
+    fn lower_direct_flow(
+        &mut self,
+        opcode: Opcode,
+        target: &LabelOrNode,
+        condition: Option<Varnode>,
+    ) -> Result<(), PcodeLowerError> {
+        let target = match target {
+            LabelOrNode::Label(label) => {
+                // A local branch keeps its symbolic target: a streaming sink
+                // cannot be handed a relative offset to a label it has not
+                // reached yet.
+                let id = self.label_id(label)?;
+                self.sink.branch_label(opcode, id, condition);
+                return Ok(());
+            }
+            LabelOrNode::Node(_) => {
+                return Err(PcodeLowerError::InternalNode("unresolved branch target"));
+            }
+            LabelOrNode::Expr(expr) => self.direct_target(expr)?,
+        };
+        match condition {
+            Some(condition) => self.emit(opcode, None, &[target, condition]),
+            None => self.emit(opcode, None, &[target]),
+        }
+        Ok(())
+    }
+
+    fn lower_indirect_flow(
+        &mut self,
+        opcode: Opcode,
+        target: &Expression,
+    ) -> Result<(), PcodeLowerError> {
+        let target = self.lower_expr(target, None)?;
+        self.emit(opcode, None, &[target]);
+        Ok(())
+    }
+
+    fn direct_target(&self, target: &Expression) -> Result<Varnode, PcodeLowerError> {
+        let ExpressionTy::SizedInt { value, size } = target.ty else {
+            return Err(PcodeLowerError::InvalidDirectTarget);
+        };
+        let size = size
+            .or(target.size)
+            .or_else(|| self.context.address_size(self.context.default_space()))
+            .ok_or(PcodeLowerError::UnknownSize)?;
+        Self::checked_size(size)?;
+        Ok(Varnode::new(self.context.default_space(), value, size))
+    }
+
+    fn lower_effect(&mut self, expr: &Expression) -> Result<(), PcodeLowerError> {
+        match &expr.ty {
+            ExpressionTy::PcodeOp { id, args } => {
+                let inputs = self.lower_userop_inputs(*id, args)?;
+                self.emit(Opcode::CallOther, None, &inputs);
+                Ok(())
+            }
+            ExpressionTy::MacroCall { .. } => Err(PcodeLowerError::InternalNode("macro call")),
+            ExpressionTy::DeferredCall { .. } => {
+                Err(PcodeLowerError::InternalNode("deferred call"))
+            }
+            _ => Err(PcodeLowerError::Unsupported("a discarded value expression")),
+        }
+    }
+
+    fn lower_expr(
+        &mut self,
+        expr: &Expression,
+        requested_output: Option<Varnode>,
+    ) -> Result<Varnode, PcodeLowerError> {
+        match &expr.ty {
+            ExpressionTy::SizedInt { value, size } => {
+                // Raw p-code integer literals take the width of the
+                // operation that consumes them, including an explicitly
+                // suffixed source literal used for a wider x86-64 register
+                // write (for example `R10 = imm32`).
+                let input = Varnode::constant(
+                    *value,
+                    requested_output
+                        .map(|output| output.size)
+                        .or(*size)
+                        .or(expr.size)
+                        .ok_or(PcodeLowerError::UnknownSize)?,
+                );
+                self.copy_if_requested(input, requested_output)
+            }
+            ExpressionTy::Ident(Ident::BitRange(id)) => {
+                self.lower_named_bitrange(*id, requested_output)
+            }
+            ExpressionTy::Ident(ident) => {
+                let input = self.storage_for_ident(ident.clone(), expr.size)?;
+                self.copy_if_requested(input, requested_output)
+            }
+            ExpressionTy::Load(load) => self.lower_load(expr, load, requested_output),
+            ExpressionTy::SubPieceMsb { src, count } => {
+                let input = self.lower_expr(src, None)?;
+                let size = requested_output
+                    .map(|output| output.size)
+                    .or(expr.size)
+                    .unwrap_or_else(|| input.size.saturating_sub(*count));
+                let output = self.output(requested_output, size)?;
+                if *count >= input.size || size > input.size - count {
+                    return Err(PcodeLowerError::InvalidRange {
+                        start: count.saturating_mul(8),
+                        size: size.saturating_mul(8),
+                        storage_bits: input.size.saturating_mul(8),
+                    });
+                }
+                self.emit(
+                    Opcode::SubPiece,
+                    Some(output),
+                    &[input, Varnode::constant(*count as u64, 8)],
+                );
+                Ok(output)
+            }
+            ExpressionTy::SubPieceLsb { src, count } => {
+                let input = self.lower_expr(src, None)?;
+                if *count == 0 || *count > input.size {
+                    return Err(PcodeLowerError::InvalidRange {
+                        start: 0,
+                        size: count.saturating_mul(8),
+                        storage_bits: input.size.saturating_mul(8),
+                    });
+                }
+                let output = self.output(requested_output, *count)?;
+                self.emit(
+                    Opcode::SubPiece,
+                    Some(output),
+                    &[input, Varnode::constant(0, 8)],
+                );
+                Ok(output)
+            }
+            ExpressionTy::Range(range) => self.lower_range(range, requested_output),
+            ExpressionTy::FunctionCall { builtin, args } => {
+                self.lower_builtin(expr, *builtin, args, requested_output)
+            }
+            ExpressionTy::PcodeOp { id, args } => {
+                let size = requested_output
+                    .map(|output| output.size)
+                    .or(expr.size)
+                    .ok_or(PcodeLowerError::UnknownSize)?;
+                let output = self.output(requested_output, size)?;
+                let inputs = self.lower_userop_inputs(*id, args)?;
+                self.emit(Opcode::CallOther, Some(output), &inputs);
+                Ok(output)
+            }
+            ExpressionTy::MacroCall { .. } => Err(PcodeLowerError::InternalNode("macro call")),
+            ExpressionTy::DeferredCall { .. } => {
+                Err(PcodeLowerError::InternalNode("deferred call"))
+            }
+            ExpressionTy::Unop(unop) => self.lower_unop(expr, unop.op, &unop.e, requested_output),
+            ExpressionTy::Binop(binop) => {
+                self.lower_binop(expr, binop.op, &binop.lhs, &binop.rhs, requested_output)
+            }
+        }
+    }
+
+    fn lower_load(
+        &mut self,
+        expr: &Expression,
+        load: &Load,
+        requested_output: Option<Varnode>,
+    ) -> Result<Varnode, PcodeLowerError> {
+        let space = self.load_space(load)?;
+        let ptr = self.lower_expr(&load.ptr, None)?;
+        if space != SPACE_CONST {
+            self.validate_pointer(space, ptr)?;
+        }
+        let size = requested_output
+            .map(|output| output.size)
+            .or(load.size)
+            .or(expr.size)
+            .ok_or(PcodeLowerError::UnknownSize)?;
+        if space == SPACE_CONST {
+            if ptr.size != size {
+                return Err(PcodeLowerError::Unsupported(
+                    "a constant-space load that changes width",
+                ));
+            }
+            return self.copy_if_requested(ptr, requested_output);
+        }
+        let output = self.output(requested_output, size)?;
+        self.emit(Opcode::Load, Some(output), &[Self::space_id(space), ptr]);
+        Ok(output)
+    }
+
+    fn lower_builtin(
+        &mut self,
+        expr: &Expression,
+        builtin: Builtin,
+        args: &[Expression],
+        requested_output: Option<Varnode>,
+    ) -> Result<Varnode, PcodeLowerError> {
+        let opcode = match builtin {
+            Builtin::Carry => Opcode::IntCarry,
+            Builtin::Scarry => Opcode::IntSCarry,
+            Builtin::Sborrow => Opcode::IntSBorrow,
+            Builtin::Nan => Opcode::FloatNan,
+            Builtin::Abs => Opcode::FloatAbs,
+            Builtin::Sqrt => Opcode::FloatSqrt,
+            Builtin::Floor => Opcode::FloatFloor,
+            Builtin::Ceil => Opcode::FloatCeil,
+            Builtin::Round => Opcode::FloatRound,
+            Builtin::Int2Float => Opcode::FloatInt2Float,
+            Builtin::Float2Float => Opcode::FloatFloat2Float,
+            Builtin::Trunc => Opcode::FloatTrunc,
+            Builtin::Zext => Opcode::IntZext,
+            Builtin::Sext => Opcode::IntSext,
+            Builtin::Popcount => Opcode::PopCount,
+            Builtin::Lzcount => Opcode::LzCount,
+            Builtin::Cpool => Opcode::CpoolRef,
+            Builtin::NewObject => Opcode::New,
+        };
+        let size = requested_output
+            .map(|output| output.size)
+            .or(expr.size)
+            .or(match builtin {
+                Builtin::Carry | Builtin::Scarry | Builtin::Sborrow | Builtin::Nan => Some(1),
+                _ => None,
+            })
+            .ok_or(PcodeLowerError::UnknownSize)?;
+        let output = self.output(requested_output, size)?;
+        // The carry-family builtins return a boolean but consume equally-sized
+        // integer operands. Their result width therefore cannot provide the
+        // context required by a nested `zext`; carry the first operand's width
+        // into the remaining operands instead.
+        let inputs = if matches!(builtin, Builtin::Carry | Builtin::Scarry | Builtin::Sborrow)
+            && !args.is_empty()
+        {
+            // The first operand can be an unsized literal (`sborrow(0, RAX)`
+            // in x86 `NEG`). Carry-family operands must all have the same
+            // width, so derive it from any concrete operand before lowering.
+            let operand_size = args
+                .iter()
+                .find_map(|arg| self.expr_size(arg))
+                .ok_or(PcodeLowerError::UnknownSize)?;
+            args.iter()
+                .map(|arg| self.lower_expr_with_size(arg, operand_size))
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            args.iter()
+                .map(|arg| self.lower_expr(arg, None))
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        self.emit(opcode, Some(output), &inputs);
+        Ok(output)
+    }
+
+    fn lower_unop(
+        &mut self,
+        expr: &Expression,
+        op: UnaryOperator,
+        operand: &Expression,
+        requested_output: Option<Varnode>,
+    ) -> Result<Varnode, PcodeLowerError> {
+        if let UnaryOperator::AddressOf(size) = op {
+            // An address symbol such as `inst_next` already *is* its address;
+            // taking its address only fixes the width.
+            if let ExpressionTy::SizedInt {
+                value,
+                size: literal_size,
+            } = &operand.ty
+            {
+                let size = size
+                    .or(*literal_size)
+                    .or(operand.size)
+                    .ok_or(PcodeLowerError::UnknownSize)?;
+                return self.copy_if_requested(Varnode::constant(*value, size), requested_output);
+            }
+            let storage = self.storage_from_expr(operand)?;
+            let size = size
+                .or_else(|| self.context.address_size(storage.space))
+                .ok_or(PcodeLowerError::UnknownSize)?;
+            return self
+                .copy_if_requested(Varnode::constant(storage.offset, size), requested_output);
+        }
+        let opcode = match op {
+            UnaryOperator::LogicalNot => Opcode::BoolNegate,
+            UnaryOperator::BitwiseNot => Opcode::IntNegate,
+            UnaryOperator::Minus => Opcode::Int2Comp,
+            UnaryOperator::FloatMinus => Opcode::FloatNeg,
+            UnaryOperator::AddressOf(_) => unreachable!(),
+        };
+        // Unsized integer literals are polymorphic. Resolve the unary result
+        // width before lowering its operand so `~8` can inherit the width of
+        // its assignment (for example x86 `CLTS`), rather than failing while
+        // lowering the literal without a consumer.
+        let size = requested_output
+            .map(|output| output.size)
+            .or(expr.size)
+            .or_else(|| (op == UnaryOperator::LogicalNot).then_some(1))
+            .or_else(|| self.expr_size(operand))
+            .ok_or(PcodeLowerError::UnknownSize)?;
+        // Preserve a concrete operand's native width (notably BOOL_NEGATE,
+        // whose input need not be one byte); only force the result width into
+        // a width-less operand such as an integer literal.
+        let input = if self.expr_size(operand).is_some() {
+            self.lower_expr(operand, None)?
+        } else {
+            self.lower_expr_with_size(operand, size)?
+        };
+        let output = self.output(requested_output, size)?;
+        self.emit(opcode, Some(output), &[input]);
+        Ok(output)
+    }
+
+    fn lower_binop(
+        &mut self,
+        expr: &Expression,
+        op: BinaryOperator,
+        lhs: &Expression,
+        rhs: &Expression,
+        requested_output: Option<Varnode>,
+    ) -> Result<Varnode, PcodeLowerError> {
+        let (opcode, reverse) = binary_opcode(op);
+        // An arithmetic result has the same width as its operands. Comparisons
+        // and boolean operations instead produce one byte, so obtain their
+        // operand width from either side. This supplies the context needed by
+        // unsized SLEIGH literals and compound expressions (for example the
+        // `2 * zext(DF)` in x86 MOVS pointer updates).
+        let is_boolean = op.is_comparison()
+            || matches!(
+                op,
+                BinaryOperator::LogicalXor | BinaryOperator::LogicalAnd | BinaryOperator::LogicalOr
+            );
+        let input_size = if is_boolean {
+            self.expr_size(lhs).or_else(|| self.expr_size(rhs))
+        } else {
+            requested_output
+                .map(|output| output.size)
+                .or(expr.size)
+                .or_else(|| self.expr_size(lhs))
+                .or_else(|| self.expr_size(rhs))
+        };
+        let mut inputs = match input_size {
+            Some(size) => vec![
+                self.lower_expr_with_size(lhs, size)?,
+                self.lower_expr_with_size(rhs, size)?,
+            ],
+            None => vec![self.lower_expr(lhs, None)?, self.lower_expr(rhs, None)?],
+        };
+        if reverse {
+            inputs.swap(0, 1);
+        }
+        let size = requested_output
+            .map(|output| output.size)
+            .or(expr.size)
+            .or_else(|| op.is_comparison().then_some(1))
+            .or(input_size)
+            .ok_or(PcodeLowerError::UnknownSize)?;
+        let output = self.output(requested_output, size)?;
+        if (op.is_comparison()
+            || matches!(
+                op,
+                BinaryOperator::LogicalXor | BinaryOperator::LogicalAnd | BinaryOperator::LogicalOr
+            ))
+            && output.size != 1
+        {
+            return Err(PcodeLowerError::InvalidBooleanSize(output.size));
+        }
+        if inputs[0].size != inputs[1].size {
+            return Err(PcodeLowerError::InputSizeMismatch {
+                operation: "binary operation",
+                left: inputs[0].size,
+                right: inputs[1].size,
+            });
+        }
+        if !op.is_comparison()
+            && !matches!(
+                op,
+                BinaryOperator::LogicalXor | BinaryOperator::LogicalAnd | BinaryOperator::LogicalOr
+            )
+            && output.size != inputs[0].size
+        {
+            return Err(PcodeLowerError::CopySizeMismatch {
+                input: inputs[0].size,
+                output: output.size,
+            });
+        }
+        self.emit(opcode, Some(output), &inputs);
+        Ok(output)
+    }
+
+    /// Lowers an operand in a context that requires `size` bytes.
+    ///
+    /// SLEIGH permits a narrow register or temporary as a shift count or bit
+    /// index for a wider value. Raw p-code does not: both inputs of these
+    /// operations must have the same width. Requesting an output of `size`
+    /// propagates that context into compound expressions, while
+    /// [`copy_if_requested`](Self::copy_if_requested) inserts an explicit
+    /// zero-extension or low-byte `SUBPIECE` for a directly stored value.
+    fn lower_expr_with_size(
+        &mut self,
+        expr: &Expression,
+        size: usize,
+    ) -> Result<Varnode, PcodeLowerError> {
+        // SLEIGH integer literals are polymorphic in raw p-code: the
+        // surrounding operation determines their varnode width (for example
+        // `RAX + 1`). This applies even when parsing retained a literal's
+        // minimal source width.
+        if let ExpressionTy::SizedInt { value, .. } = &expr.ty {
+            return Ok(Varnode::constant(*value, size));
+        }
+        if self.expr_size(expr) == Some(size) {
+            return self.lower_expr(expr, None);
+        }
+        let output = self.allocate_unique(size)?;
+        self.lower_expr(expr, Some(output))
+    }
+
+    fn lower_range(
+        &mut self,
+        range: &Range,
+        requested_output: Option<Varnode>,
+    ) -> Result<Varnode, PcodeLowerError> {
+        let input = self.lower_expr(&range.value, None)?;
+        let (start, bits) = range_params(range)?;
+        self.extract_range(input, start, bits, requested_output)
+    }
+
+    fn lower_named_bitrange(
+        &mut self,
+        id: BitRangeFieldId,
+        requested_output: Option<Varnode>,
+    ) -> Result<Varnode, PcodeLowerError> {
+        let info = self
+            .context
+            .bitrange_info(id)
+            .ok_or(PcodeLowerError::Unsupported("an unknown named bit range"))?;
+        self.extract_range(info.storage, info.start, info.size, requested_output)
+    }
+
+    fn extract_range(
+        &mut self,
+        input: Varnode,
+        start: usize,
+        bits: usize,
+        requested_output: Option<Varnode>,
+    ) -> Result<Varnode, PcodeLowerError> {
+        let result_size = Self::validate_range(input, start, bits)?;
+        if let Some(output) = requested_output {
+            if output.size != result_size {
+                return Err(PcodeLowerError::CopySizeMismatch {
+                    input: result_size,
+                    output: output.size,
+                });
+            }
+        }
+        let shifted = self.allocate_unique(input.size)?;
+        self.emit(
+            Opcode::IntRight,
+            Some(shifted),
+            &[input, Varnode::constant(start as u64, input.size)],
+        );
+        let masked = self.allocate_unique(input.size)?;
+        self.emit(
+            Opcode::IntAnd,
+            Some(masked),
+            &[shifted, Varnode::constant(Self::mask(bits)?, input.size)],
+        );
+        let output = self.output(requested_output, result_size)?;
+        self.emit(
+            Opcode::SubPiece,
+            Some(output),
+            &[masked, Varnode::constant(0, 8)],
+        );
+        Ok(output)
+    }
+
+    fn lower_range_assignment(
+        &mut self,
+        range: &Range,
+        rhs: &Expression,
+    ) -> Result<(), PcodeLowerError> {
+        if let ExpressionTy::Load(load) = &range.value.ty {
+            return self.lower_load_range_assignment(load, range, rhs);
+        }
+        let storage = self.storage_from_expr(&range.value)?;
+        let (start, bits) = range_params(range)?;
+        self.insert_range(storage, start, bits, rhs)
+    }
+
+    /// Lowers a bit-range write into a memory load as load/modify/store. SLEIGH
+    /// uses this form for packed MMX lanes backed by private RAM, where an
+    /// address-of expression cannot name a raw-p-code varnode directly.
+    fn lower_load_range_assignment(
+        &mut self,
+        load: &Load,
+        range: &Range,
+        rhs: &Expression,
+    ) -> Result<(), PcodeLowerError> {
+        let storage = self.lower_load(&range.value, load, None)?;
+        let (start, bits) = range_params(range)?;
+        Self::validate_range(storage, start, bits)?;
+        if storage.size > 8 {
+            return Err(PcodeLowerError::InvalidRange {
+                start,
+                size: bits,
+                storage_bits: storage.size.saturating_mul(8),
+            });
+        }
+        let value = self.lower_expr_with_size(rhs, bits.div_ceil(8))?;
+        if value.size > storage.size {
+            return Err(PcodeLowerError::InputSizeMismatch {
+                operation: "bit-range assignment",
+                left: storage.size,
+                right: value.size,
+            });
+        }
+        let extended = if value.size == storage.size {
+            value
+        } else {
+            let output = self.allocate_unique(storage.size)?;
+            self.emit(Opcode::IntZext, Some(output), &[value]);
+            output
+        };
+        let inserted = self.allocate_unique(storage.size)?;
+        self.emit(
+            Opcode::IntAnd,
+            Some(inserted),
+            &[extended, Varnode::constant(Self::mask(bits)?, storage.size)],
+        );
+        let shifted = self.allocate_unique(storage.size)?;
+        self.emit(
+            Opcode::IntLeft,
+            Some(shifted),
+            &[inserted, Varnode::constant(start as u64, storage.size)],
+        );
+        let clear_mask = !(Self::mask(bits)? << start);
+        let kept = self.allocate_unique(storage.size)?;
+        self.emit(
+            Opcode::IntAnd,
+            Some(kept),
+            &[storage, Varnode::constant(clear_mask, storage.size)],
+        );
+        let result = self.allocate_unique(storage.size)?;
+        self.emit(Opcode::IntOr, Some(result), &[kept, shifted]);
+
+        let space = self.load_space(load)?;
+        if space == SPACE_CONST {
+            return Err(PcodeLowerError::Unsupported("a store to constant space"));
+        }
+        let ptr = self.lower_expr(&load.ptr, None)?;
+        self.validate_pointer(space, ptr)?;
+        self.emit(Opcode::Store, None, &[Self::space_id(space), ptr, result]);
+        Ok(())
+    }
+
+    fn insert_range(
+        &mut self,
+        storage: Varnode,
+        start: usize,
+        bits: usize,
+        rhs: &Expression,
+    ) -> Result<(), PcodeLowerError> {
+        Self::validate_range(storage, start, bits)?;
+        // Inserting needs a full-width clear mask. Constants in this AST are
+        // u64, so zero-extending one into larger storage would incorrectly
+        // clear every high bit.
+        if storage.size > 8 {
+            return Err(PcodeLowerError::InvalidRange {
+                start,
+                size: bits,
+                storage_bits: storage.size.saturating_mul(8),
+            });
+        }
+        // A range assignment fixes the RHS width even when the RHS is a
+        // user-op result whose source expression does not carry one.
+        let value = self.lower_expr_with_size(rhs, bits.div_ceil(8))?;
+        if value.size > storage.size {
+            return Err(PcodeLowerError::InputSizeMismatch {
+                operation: "bit-range assignment",
+                left: storage.size,
+                right: value.size,
+            });
+        }
+        let extended = if value.size == storage.size {
+            value
+        } else {
+            let output = self.allocate_unique(storage.size)?;
+            self.emit(Opcode::IntZext, Some(output), &[value]);
+            output
+        };
+        let inserted = self.allocate_unique(storage.size)?;
+        self.emit(
+            Opcode::IntAnd,
+            Some(inserted),
+            &[extended, Varnode::constant(Self::mask(bits)?, storage.size)],
+        );
+        let shifted = self.allocate_unique(storage.size)?;
+        self.emit(
+            Opcode::IntLeft,
+            Some(shifted),
+            &[inserted, Varnode::constant(start as u64, storage.size)],
+        );
+        let clear_mask = !(Self::mask(bits)? << start);
+        let kept = self.allocate_unique(storage.size)?;
+        self.emit(
+            Opcode::IntAnd,
+            Some(kept),
+            &[storage, Varnode::constant(clear_mask, storage.size)],
+        );
+        self.emit(Opcode::IntOr, Some(storage), &[kept, shifted]);
+        Ok(())
+    }
+
+    fn validate_range(
+        storage: Varnode,
+        start: usize,
+        size: usize,
+    ) -> Result<usize, PcodeLowerError> {
+        let storage_bits = storage
+            .size
+            .checked_mul(8)
+            .ok_or(PcodeLowerError::InvalidRange {
+                start,
+                size,
+                storage_bits: usize::MAX,
+            })?;
+        if size == 0 || size > 64 || start.checked_add(size).is_none_or(|end| end > storage_bits) {
+            return Err(PcodeLowerError::InvalidRange {
+                start,
+                size,
+                storage_bits,
+            });
+        }
+        Ok(size.div_ceil(8))
+    }
+
+    fn mask(bits: usize) -> Result<u64, PcodeLowerError> {
+        match bits {
+            1..=63 => Ok((1u64 << bits) - 1),
+            64 => Ok(u64::MAX),
+            _ => Err(PcodeLowerError::InvalidRange {
+                start: 0,
+                size: bits,
+                storage_bits: 64,
+            }),
+        }
+    }
+
+    fn validate_pointer(&self, space: SpaceId, ptr: Varnode) -> Result<(), PcodeLowerError> {
+        let expected = self
+            .context
+            .address_size(space)
+            .ok_or(PcodeLowerError::UnresolvedSpace)?;
+        Self::checked_size(expected)?;
+        if ptr.size != expected {
+            return Err(PcodeLowerError::AddressSizeMismatch {
+                expected,
+                actual: ptr.size,
+            });
+        }
+        Ok(())
+    }
+
+    fn storage_from_expr(&mut self, expr: &Expression) -> Result<Varnode, PcodeLowerError> {
+        match &expr.ty {
+            ExpressionTy::Ident(ident) => self.storage_for_ident(ident.clone(), expr.size),
+            _ => Err(PcodeLowerError::Unsupported(
+                "address-of a non-varnode expression",
+            )),
+        }
+    }
+
+    fn storage_for_ident(
+        &mut self,
+        ident: Ident,
+        size: Option<usize>,
+    ) -> Result<Varnode, PcodeLowerError> {
+        match ident {
+            Ident::Register(id) => self
+                .context
+                .register_varnode(id)
+                .ok_or(PcodeLowerError::UnknownRegister(id)),
+            Ident::Named(id) => {
+                let size = self.plan.local_sizes.get(&id).copied().or(size);
+                if let Some(varnode) = self.locals.get(&id) {
+                    if let Some(size) = size
+                        && size != varnode.size
+                    {
+                        return Err(PcodeLowerError::CopySizeMismatch {
+                            input: varnode.size,
+                            output: size,
+                        });
+                    }
+                    return Ok(*varnode);
+                }
+                let varnode = self.allocate_unique(size.ok_or(PcodeLowerError::UnknownSize)?)?;
+                self.locals.insert(id, varnode);
+                Ok(varnode)
+            }
+            Ident::BitRange(_) => Err(PcodeLowerError::Unsupported("a named bit range")),
+            Ident::Field(_) => Err(PcodeLowerError::UnresolvedIdentifier("field")),
+            Ident::Table(_) => Err(PcodeLowerError::UnresolvedIdentifier("table")),
+            Ident::Global(_) => Err(PcodeLowerError::UnresolvedIdentifier("global")),
+        }
+    }
+
+    fn lower_userop_inputs(
+        &mut self,
+        id: PCodeOpId,
+        args: &[Expression],
+    ) -> Result<Vec<Varnode>, PcodeLowerError> {
+        let mut inputs = Vec::with_capacity(args.len() + 1);
+        inputs.push(Varnode::constant(usize::from(id) as u64, 4));
+        inputs.extend(
+            args.iter()
+                .map(|arg| self.lower_expr(arg, None))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        Ok(inputs)
+    }
+
+    fn copy_if_requested(
+        &mut self,
+        input: Varnode,
+        requested_output: Option<Varnode>,
+    ) -> Result<Varnode, PcodeLowerError> {
+        match requested_output {
+            Some(output) if output != input && input.size == output.size => {
+                self.emit(Opcode::Copy, Some(output), &[input]);
+                Ok(output)
+            }
+            Some(output) if input.size < output.size => {
+                self.emit(Opcode::IntZext, Some(output), &[input]);
+                Ok(output)
+            }
+            Some(output) if input.size > output.size => {
+                self.emit(
+                    Opcode::SubPiece,
+                    Some(output),
+                    &[input, Varnode::constant(0, 8)],
+                );
+                Ok(output)
+            }
+            Some(output) => Ok(output),
+            None => Ok(input),
+        }
+    }
+
+    fn output(
+        &mut self,
+        requested_output: Option<Varnode>,
+        size: usize,
+    ) -> Result<Varnode, PcodeLowerError> {
+        match requested_output {
+            Some(output) => {
+                Self::checked_size(output.size)?;
+                Ok(output)
+            }
+            None => self.allocate_unique(size),
+        }
+    }
+
+    fn allocate_unique(&mut self, size: usize) -> Result<Varnode, PcodeLowerError> {
+        Self::checked_size(size)?;
+        let offset = self.next_unique;
+        self.next_unique = self
+            .next_unique
+            .checked_add(size as u64)
+            .ok_or(PcodeLowerError::UniqueSpaceOverflow)?;
+        Ok(Varnode::new(self.context.unique_space(), offset, size))
+    }
+
+    fn label_id(&self, label: &str) -> Result<LabelId, PcodeLowerError> {
+        self.plan
+            .label_id(label)
+            .ok_or_else(|| PcodeLowerError::UnknownLabel(Box::from(label)))
+    }
+
+    fn checked_size(size: usize) -> Result<(), PcodeLowerError> {
+        if size == 0 {
+            Err(PcodeLowerError::ZeroSize)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn space_id(space: SpaceId) -> Varnode {
+        Varnode::constant(usize::from(space) as u64, 4)
+    }
+}
+
+/// The read-only pass which produces a [`PcodePlan`].
+struct Planner<'a, C: PcodeLoweringContext + ?Sized> {
+    context: &'a C,
+    plan: PcodePlan,
+}
+
+impl<'a, C: PcodeLoweringContext + ?Sized> Planner<'a, C> {
+    fn plan(&mut self, ast: &PcodeAst) {
+        self.infer_local_sizes(ast);
+        for statement in &ast.statements {
+            match &statement.ty {
+                AstNode::Label(label) => self.plan.define_label(label),
+                AstNode::Branch { target } | AstNode::ConditionalBranch { target, .. } => {
+                    // A target this pass cannot resolve is left out; emission
+                    // reports it with the error it would have reported before.
+                    if let LabelOrNode::Expr(expr) = target
+                        && let Some(address) = self.direct_address(expr)
+                        && !self.plan.direct_branches.contains(&address)
+                    {
+                        self.plan.direct_branches.push(address);
+                    }
+                }
+                AstNode::Call { target } => {
+                    if let LabelOrNode::Expr(expr) = target
+                        && let Some(address) = self.direct_address(expr)
+                        && !self.plan.direct_calls.contains(&address)
+                    {
+                        self.plan.direct_calls.push(address);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn direct_address(&self, target: &Expression) -> Option<u64> {
+        match target.ty {
+            ExpressionTy::SizedInt { value, .. } => Some(value),
+            _ => None,
+        }
     }
 
     /// Resolve local widths from their uses before emitting operations. A
@@ -502,11 +1579,11 @@ impl<'a, C: PcodeLoweringContext + ?Sized> Lowerer<'a, C> {
         // Each pass can discover at least one previously unknown local. The
         // extra pass propagates that discovery through a chain of locals.
         for _ in 0..=ast.statements.len() {
-            let before = self.local_sizes.len();
+            let before = self.plan.local_sizes.len();
             for statement in &ast.statements {
                 self.constrain_statement(&statement.ty);
             }
-            if self.local_sizes.len() == before {
+            if self.plan.local_sizes.len() == before {
                 break;
             }
         }
@@ -530,7 +1607,7 @@ impl<'a, C: PcodeLoweringContext + ?Sized> Lowerer<'a, C> {
                 if let Ident::Named(id) = lhs
                     && let Some(size) = expected.or(inferred)
                 {
-                    self.local_sizes.entry(*id).or_insert(size);
+                    self.plan.local_sizes.entry(*id).or_insert(size);
                 }
             }
             AstNode::LoadAssignment { lhs, rhs, .. } => {
@@ -541,7 +1618,7 @@ impl<'a, C: PcodeLoweringContext + ?Sized> Lowerer<'a, C> {
                 self.constrain_expr(rhs, lhs.size);
             }
             AstNode::RangeAssignment { lhs, rhs, .. } => {
-                if let Ok((_, bits)) = Self::range_params(lhs) {
+                if let Ok((_, bits)) = range_params(lhs) {
                     self.constrain_expr(rhs, Some(bits.div_ceil(8)));
                 }
             }
@@ -576,10 +1653,10 @@ impl<'a, C: PcodeLoweringContext + ?Sized> Lowerer<'a, C> {
         match &expr.ty {
             ExpressionTy::SizedInt { .. } => expected,
             ExpressionTy::Ident(Ident::Named(id)) => {
-                if let Some(&size) = self.local_sizes.get(id) {
+                if let Some(&size) = self.plan.local_sizes.get(id) {
                     Some(size)
                 } else if let Some(size) = expected {
-                    self.local_sizes.insert(*id, size);
+                    self.plan.local_sizes.insert(*id, size);
                     Some(size)
                 } else {
                     None
@@ -668,952 +1745,59 @@ impl<'a, C: PcodeLoweringContext + ?Sized> Lowerer<'a, C> {
             ExpressionTy::MacroCall { .. } | ExpressionTy::DeferredCall { .. } => expected,
         }
     }
+}
 
-    fn storage_size(&self, ident: &Ident) -> Option<usize> {
-        match ident {
-            Ident::Register(id) => self
-                .context
-                .register_varnode(*id)
-                .map(|varnode| varnode.size),
-            Ident::BitRange(id) => self
-                .context
-                .bitrange_info(*id)
-                .map(|info| info.size.div_ceil(8)),
-            Ident::Named(id) => self
-                .local_sizes
-                .get(id)
-                .copied()
-                .or_else(|| self.locals.get(id).map(|varnode| varnode.size)),
-            Ident::Field(_) | Ident::Table(_) | Ident::Global(_) => None,
-        }
+impl<'a, C: PcodeLoweringContext + ?Sized> Sizing for Planner<'a, C> {
+    type Ctx = C;
+
+    fn context(&self) -> &C {
+        self.context
     }
 
-    fn storage_from_expr_size(&self, expr: &Expression) -> Option<Varnode> {
-        match &expr.ty {
-            ExpressionTy::Ident(Ident::Register(id)) => self.context.register_varnode(*id),
-            ExpressionTy::Ident(Ident::BitRange(id)) => {
-                self.context.bitrange_info(*id).map(|info| info.storage)
-            }
-            _ => None,
-        }
+    fn local_size(&self, id: &LocalVarId) -> Option<usize> {
+        self.plan.local_sizes.get(id).copied()
+    }
+}
+
+impl<C: PcodeLoweringContext + ?Sized, S: PcodeSink + ?Sized> Sizing for Lowerer<'_, '_, '_, C, S> {
+    type Ctx = C;
+
+    fn context(&self) -> &C {
+        self.context
     }
 
-    fn lower_statement(&mut self, statement: &AstNode) -> Result<(), PcodeLowerError> {
-        match statement {
-            AstNode::Assignment {
-                lhs: Ident::BitRange(id),
-                rhs,
-                ..
-            } => {
-                let info = self
-                    .context
-                    .bitrange_info(*id)
-                    .ok_or(PcodeLowerError::Unsupported("an unknown named bit range"))?;
-                self.insert_range(info.storage, info.start, info.size, rhs)?;
-            }
-            AstNode::Assignment { lhs, size, rhs } => {
-                let output =
-                    self.storage_for_ident(lhs.clone(), size.or_else(|| self.expr_size(rhs)))?;
-                self.lower_expr(rhs, Some(output))?;
-            }
-            AstNode::LoadAssignment { lhs, rhs, .. } => self.lower_store(lhs, rhs)?,
-            AstNode::RangeAssignment { lhs, rhs, .. } => self.lower_range_assignment(lhs, rhs)?,
-            AstNode::Build(_) => return Err(PcodeLowerError::InternalNode("build statement")),
-            AstNode::DelaySlot(_) => {
-                return Err(PcodeLowerError::InternalNode("delay-slot directive"));
-            }
-            AstNode::DeferredBuild(_) => {
-                return Err(PcodeLowerError::InternalNode("deferred build statement"));
-            }
-            AstNode::Label(label) => {
-                if self.labels.insert(label.clone(), self.ops.len()).is_some() {
-                    return Err(PcodeLowerError::DuplicateLabel(label.clone()));
-                }
-            }
-            AstNode::Branch { target } => self.lower_direct_flow(Opcode::Branch, target, None)?,
-            AstNode::ConditionalBranch { condition, target } => {
-                let condition = self.lower_expr(condition, None)?;
-                self.lower_direct_flow(Opcode::CBranch, target, Some(condition))?;
-            }
-            AstNode::BranchIndirect { target } => {
-                self.lower_indirect_flow(Opcode::BranchInd, target)?
-            }
-            AstNode::Call { target } => self.lower_direct_flow(Opcode::Call, target, None)?,
-            AstNode::CallIndirect { target } => {
-                self.lower_indirect_flow(Opcode::CallInd, target)?
-            }
-            AstNode::Return { target } => self.lower_indirect_flow(Opcode::Return, target)?,
-            AstNode::Export(_) => return Err(PcodeLowerError::InternalNode("export statement")),
-            AstNode::Expression(expr) => self.lower_effect(expr)?,
-        }
-        Ok(())
+    fn local_size(&self, id: &LocalVarId) -> Option<usize> {
+        self.plan
+            .local_sizes
+            .get(id)
+            .copied()
+            .or_else(|| self.locals.get(id).map(|varnode| varnode.size))
     }
+}
 
-    fn lower_store(&mut self, load: &Load, rhs: &Expression) -> Result<(), PcodeLowerError> {
-        let space = self.load_space(load)?;
-        if space == SPACE_CONST {
-            return Err(PcodeLowerError::Unsupported("a store to constant space"));
-        }
-        let ptr = self.lower_expr(&load.ptr, None)?;
-        self.validate_pointer(space, ptr)?;
-        let value = match load.size {
-            Some(size) => self.lower_expr_with_size(rhs, size)?,
-            None => self.lower_expr(rhs, None)?,
-        };
-        if let Some(size) = load.size {
-            Self::checked_size(size)?;
-            if size != value.size {
-                return Err(PcodeLowerError::StoreSizeMismatch {
-                    declared: size,
-                    value: value.size,
-                });
-            }
-        }
-        self.ops.push(PcodeOp::new(
-            Opcode::Store,
-            None,
-            vec![Self::space_id(space), ptr, value],
-        ));
-        Ok(())
-    }
+/// Width and space queries shared by planning and emission. Both phases must
+/// answer them identically, so they have one implementation parameterized by
+/// how each phase knows a local's width.
+trait Sizing {
+    type Ctx: PcodeLoweringContext + ?Sized;
 
-    fn lower_direct_flow(
-        &mut self,
-        opcode: Opcode,
-        target: &LabelOrNode,
-        condition: Option<Varnode>,
-    ) -> Result<(), PcodeLowerError> {
-        let target = match target {
-            LabelOrNode::Label(label) => {
-                let op_index = self.ops.len();
-                self.label_fixups.push((op_index, label.clone()));
-                Varnode::constant(0, 8)
-            }
-            LabelOrNode::Node(_) => {
-                return Err(PcodeLowerError::InternalNode("unresolved branch target"));
-            }
-            LabelOrNode::Expr(expr) => self.direct_target(expr)?,
-        };
-        let mut inputs = vec![target];
-        if let Some(condition) = condition {
-            inputs.push(condition);
-        }
-        self.ops.push(PcodeOp::new(opcode, None, inputs));
-        Ok(())
-    }
+    fn context(&self) -> &Self::Ctx;
 
-    fn lower_indirect_flow(
-        &mut self,
-        opcode: Opcode,
-        target: &Expression,
-    ) -> Result<(), PcodeLowerError> {
-        let target = self.lower_expr(target, None)?;
-        self.ops.push(PcodeOp::new(opcode, None, vec![target]));
-        Ok(())
-    }
-
-    fn direct_target(&self, target: &Expression) -> Result<Varnode, PcodeLowerError> {
-        let ExpressionTy::SizedInt { value, size } = target.ty else {
-            return Err(PcodeLowerError::InvalidDirectTarget);
-        };
-        let size = size
-            .or(target.size)
-            .or_else(|| self.context.address_size(self.context.default_space()))
-            .ok_or(PcodeLowerError::UnknownSize)?;
-        Self::checked_size(size)?;
-        Ok(Varnode::new(self.context.default_space(), value, size))
-    }
-
-    fn lower_effect(&mut self, expr: &Expression) -> Result<(), PcodeLowerError> {
-        match &expr.ty {
-            ExpressionTy::PcodeOp { id, args } => {
-                let inputs = self.lower_userop_inputs(*id, args)?;
-                self.ops.push(PcodeOp::new(Opcode::CallOther, None, inputs));
-                Ok(())
-            }
-            ExpressionTy::MacroCall { .. } => Err(PcodeLowerError::InternalNode("macro call")),
-            ExpressionTy::DeferredCall { .. } => {
-                Err(PcodeLowerError::InternalNode("deferred call"))
-            }
-            _ => Err(PcodeLowerError::Unsupported("a discarded value expression")),
-        }
-    }
-
-    fn lower_expr(
-        &mut self,
-        expr: &Expression,
-        requested_output: Option<Varnode>,
-    ) -> Result<Varnode, PcodeLowerError> {
-        match &expr.ty {
-            ExpressionTy::SizedInt { value, size } => {
-                // Raw p-code integer literals take the width of the
-                // operation that consumes them, including an explicitly
-                // suffixed source literal used for a wider x86-64 register
-                // write (for example `R10 = imm32`).
-                let input = Varnode::constant(
-                    *value,
-                    requested_output
-                        .map(|output| output.size)
-                        .or(*size)
-                        .or(expr.size)
-                        .ok_or(PcodeLowerError::UnknownSize)?,
-                );
-                self.copy_if_requested(input, requested_output)
-            }
-            ExpressionTy::Ident(Ident::BitRange(id)) => {
-                self.lower_named_bitrange(*id, requested_output)
-            }
-            ExpressionTy::Ident(ident) => {
-                let input = self.storage_for_ident(ident.clone(), expr.size)?;
-                self.copy_if_requested(input, requested_output)
-            }
-            ExpressionTy::Load(load) => self.lower_load(expr, load, requested_output),
-            ExpressionTy::SubPieceMsb { src, count } => {
-                let input = self.lower_expr(src, None)?;
-                let size = requested_output
-                    .map(|output| output.size)
-                    .or(expr.size)
-                    .unwrap_or_else(|| input.size.saturating_sub(*count));
-                let output = self.output(requested_output, size)?;
-                if *count >= input.size || size > input.size - count {
-                    return Err(PcodeLowerError::InvalidRange {
-                        start: count.saturating_mul(8),
-                        size: size.saturating_mul(8),
-                        storage_bits: input.size.saturating_mul(8),
-                    });
-                }
-                self.ops.push(PcodeOp::new(
-                    Opcode::SubPiece,
-                    Some(output),
-                    vec![input, Varnode::constant(*count as u64, 8)],
-                ));
-                Ok(output)
-            }
-            ExpressionTy::SubPieceLsb { src, count } => {
-                let input = self.lower_expr(src, None)?;
-                if *count == 0 || *count > input.size {
-                    return Err(PcodeLowerError::InvalidRange {
-                        start: 0,
-                        size: count.saturating_mul(8),
-                        storage_bits: input.size.saturating_mul(8),
-                    });
-                }
-                let output = self.output(requested_output, *count)?;
-                self.ops.push(PcodeOp::new(
-                    Opcode::SubPiece,
-                    Some(output),
-                    vec![input, Varnode::constant(0, 8)],
-                ));
-                Ok(output)
-            }
-            ExpressionTy::Range(range) => self.lower_range(range, requested_output),
-            ExpressionTy::FunctionCall { builtin, args } => {
-                self.lower_builtin(expr, *builtin, args, requested_output)
-            }
-            ExpressionTy::PcodeOp { id, args } => {
-                let size = requested_output
-                    .map(|output| output.size)
-                    .or(expr.size)
-                    .ok_or(PcodeLowerError::UnknownSize)?;
-                let output = self.output(requested_output, size)?;
-                let inputs = self.lower_userop_inputs(*id, args)?;
-                self.ops
-                    .push(PcodeOp::new(Opcode::CallOther, Some(output), inputs));
-                Ok(output)
-            }
-            ExpressionTy::MacroCall { .. } => Err(PcodeLowerError::InternalNode("macro call")),
-            ExpressionTy::DeferredCall { .. } => {
-                Err(PcodeLowerError::InternalNode("deferred call"))
-            }
-            ExpressionTy::Unop(unop) => self.lower_unop(expr, unop.op, &unop.e, requested_output),
-            ExpressionTy::Binop(binop) => {
-                self.lower_binop(expr, binop.op, &binop.lhs, &binop.rhs, requested_output)
-            }
-        }
-    }
-
-    fn lower_load(
-        &mut self,
-        expr: &Expression,
-        load: &Load,
-        requested_output: Option<Varnode>,
-    ) -> Result<Varnode, PcodeLowerError> {
-        let space = self.load_space(load)?;
-        let ptr = self.lower_expr(&load.ptr, None)?;
-        if space != SPACE_CONST {
-            self.validate_pointer(space, ptr)?;
-        }
-        let size = requested_output
-            .map(|output| output.size)
-            .or(load.size)
-            .or(expr.size)
-            .ok_or(PcodeLowerError::UnknownSize)?;
-        if space == SPACE_CONST {
-            if ptr.size != size {
-                return Err(PcodeLowerError::Unsupported(
-                    "a constant-space load that changes width",
-                ));
-            }
-            return self.copy_if_requested(ptr, requested_output);
-        }
-        let output = self.output(requested_output, size)?;
-        self.ops.push(PcodeOp::new(
-            Opcode::Load,
-            Some(output),
-            vec![Self::space_id(space), ptr],
-        ));
-        Ok(output)
-    }
-
-    fn lower_builtin(
-        &mut self,
-        expr: &Expression,
-        builtin: Builtin,
-        args: &[Expression],
-        requested_output: Option<Varnode>,
-    ) -> Result<Varnode, PcodeLowerError> {
-        let opcode = match builtin {
-            Builtin::Carry => Opcode::IntCarry,
-            Builtin::Scarry => Opcode::IntSCarry,
-            Builtin::Sborrow => Opcode::IntSBorrow,
-            Builtin::Nan => Opcode::FloatNan,
-            Builtin::Abs => Opcode::FloatAbs,
-            Builtin::Sqrt => Opcode::FloatSqrt,
-            Builtin::Floor => Opcode::FloatFloor,
-            Builtin::Ceil => Opcode::FloatCeil,
-            Builtin::Round => Opcode::FloatRound,
-            Builtin::Int2Float => Opcode::FloatInt2Float,
-            Builtin::Float2Float => Opcode::FloatFloat2Float,
-            Builtin::Trunc => Opcode::FloatTrunc,
-            Builtin::Zext => Opcode::IntZext,
-            Builtin::Sext => Opcode::IntSext,
-            Builtin::Popcount => Opcode::PopCount,
-            Builtin::Lzcount => Opcode::LzCount,
-            Builtin::Cpool => Opcode::CpoolRef,
-            Builtin::NewObject => Opcode::New,
-        };
-        let size = requested_output
-            .map(|output| output.size)
-            .or(expr.size)
-            .or(match builtin {
-                Builtin::Carry | Builtin::Scarry | Builtin::Sborrow | Builtin::Nan => Some(1),
-                _ => None,
-            })
-            .ok_or(PcodeLowerError::UnknownSize)?;
-        let output = self.output(requested_output, size)?;
-        // The carry-family builtins return a boolean but consume equally-sized
-        // integer operands. Their result width therefore cannot provide the
-        // context required by a nested `zext`; carry the first operand's width
-        // into the remaining operands instead.
-        let inputs = if matches!(builtin, Builtin::Carry | Builtin::Scarry | Builtin::Sborrow)
-            && !args.is_empty()
-        {
-            // The first operand can be an unsized literal (`sborrow(0, RAX)`
-            // in x86 `NEG`). Carry-family operands must all have the same
-            // width, so derive it from any concrete operand before lowering.
-            let operand_size = args
-                .iter()
-                .find_map(|arg| self.expr_size(arg))
-                .ok_or(PcodeLowerError::UnknownSize)?;
-            args.iter()
-                .map(|arg| self.lower_expr_with_size(arg, operand_size))
-                .collect::<Result<Vec<_>, _>>()?
-        } else {
-            args.iter()
-                .map(|arg| self.lower_expr(arg, None))
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        self.ops.push(PcodeOp::new(opcode, Some(output), inputs));
-        Ok(output)
-    }
-
-    fn lower_unop(
-        &mut self,
-        expr: &Expression,
-        op: UnaryOperator,
-        operand: &Expression,
-        requested_output: Option<Varnode>,
-    ) -> Result<Varnode, PcodeLowerError> {
-        if let UnaryOperator::AddressOf(size) = op {
-            // An address symbol such as `inst_next` already *is* its address;
-            // taking its address only fixes the width.
-            if let ExpressionTy::SizedInt {
-                value,
-                size: literal_size,
-            } = &operand.ty
-            {
-                let size = size
-                    .or(*literal_size)
-                    .or(operand.size)
-                    .ok_or(PcodeLowerError::UnknownSize)?;
-                return self.copy_if_requested(Varnode::constant(*value, size), requested_output);
-            }
-            let storage = self.storage_from_expr(operand)?;
-            let size = size
-                .or_else(|| self.context.address_size(storage.space))
-                .ok_or(PcodeLowerError::UnknownSize)?;
-            return self
-                .copy_if_requested(Varnode::constant(storage.offset, size), requested_output);
-        }
-        let opcode = match op {
-            UnaryOperator::LogicalNot => Opcode::BoolNegate,
-            UnaryOperator::BitwiseNot => Opcode::IntNegate,
-            UnaryOperator::Minus => Opcode::Int2Comp,
-            UnaryOperator::FloatMinus => Opcode::FloatNeg,
-            UnaryOperator::AddressOf(_) => unreachable!(),
-        };
-        // Unsized integer literals are polymorphic. Resolve the unary result
-        // width before lowering its operand so `~8` can inherit the width of
-        // its assignment (for example x86 `CLTS`), rather than failing while
-        // lowering the literal without a consumer.
-        let size = requested_output
-            .map(|output| output.size)
-            .or(expr.size)
-            .or_else(|| (op == UnaryOperator::LogicalNot).then_some(1))
-            .or_else(|| self.expr_size(operand))
-            .ok_or(PcodeLowerError::UnknownSize)?;
-        // Preserve a concrete operand's native width (notably BOOL_NEGATE,
-        // whose input need not be one byte); only force the result width into
-        // a width-less operand such as an integer literal.
-        let input = if self.expr_size(operand).is_some() {
-            self.lower_expr(operand, None)?
-        } else {
-            self.lower_expr_with_size(operand, size)?
-        };
-        let output = self.output(requested_output, size)?;
-        self.ops
-            .push(PcodeOp::new(opcode, Some(output), vec![input]));
-        Ok(output)
-    }
-
-    fn lower_binop(
-        &mut self,
-        expr: &Expression,
-        op: BinaryOperator,
-        lhs: &Expression,
-        rhs: &Expression,
-        requested_output: Option<Varnode>,
-    ) -> Result<Varnode, PcodeLowerError> {
-        let (opcode, reverse) = binary_opcode(op);
-        // An arithmetic result has the same width as its operands. Comparisons
-        // and boolean operations instead produce one byte, so obtain their
-        // operand width from either side. This supplies the context needed by
-        // unsized SLEIGH literals and compound expressions (for example the
-        // `2 * zext(DF)` in x86 MOVS pointer updates).
-        let is_boolean = op.is_comparison()
-            || matches!(
-                op,
-                BinaryOperator::LogicalXor | BinaryOperator::LogicalAnd | BinaryOperator::LogicalOr
-            );
-        let input_size = if is_boolean {
-            self.expr_size(lhs).or_else(|| self.expr_size(rhs))
-        } else {
-            requested_output
-                .map(|output| output.size)
-                .or(expr.size)
-                .or_else(|| self.expr_size(lhs))
-                .or_else(|| self.expr_size(rhs))
-        };
-        let mut inputs = match input_size {
-            Some(size) => vec![
-                self.lower_expr_with_size(lhs, size)?,
-                self.lower_expr_with_size(rhs, size)?,
-            ],
-            None => vec![self.lower_expr(lhs, None)?, self.lower_expr(rhs, None)?],
-        };
-        if reverse {
-            inputs.swap(0, 1);
-        }
-        let size = requested_output
-            .map(|output| output.size)
-            .or(expr.size)
-            .or_else(|| op.is_comparison().then_some(1))
-            .or(input_size)
-            .ok_or(PcodeLowerError::UnknownSize)?;
-        let output = self.output(requested_output, size)?;
-        if (op.is_comparison()
-            || matches!(
-                op,
-                BinaryOperator::LogicalXor | BinaryOperator::LogicalAnd | BinaryOperator::LogicalOr
-            ))
-            && output.size != 1
-        {
-            return Err(PcodeLowerError::InvalidBooleanSize(output.size));
-        }
-        if inputs[0].size != inputs[1].size {
-            return Err(PcodeLowerError::InputSizeMismatch {
-                operation: "binary operation",
-                left: inputs[0].size,
-                right: inputs[1].size,
-            });
-        }
-        if !op.is_comparison()
-            && !matches!(
-                op,
-                BinaryOperator::LogicalXor | BinaryOperator::LogicalAnd | BinaryOperator::LogicalOr
-            )
-            && output.size != inputs[0].size
-        {
-            return Err(PcodeLowerError::CopySizeMismatch {
-                input: inputs[0].size,
-                output: output.size,
-            });
-        }
-        self.ops.push(PcodeOp::new(opcode, Some(output), inputs));
-        Ok(output)
-    }
-
-    /// Lowers an operand in a context that requires `size` bytes.
-    ///
-    /// SLEIGH permits a narrow register or temporary as a shift count or bit
-    /// index for a wider value. Raw p-code does not: both inputs of these
-    /// operations must have the same width. Requesting an output of `size`
-    /// propagates that context into compound expressions, while
-    /// [`copy_if_requested`](Self::copy_if_requested) inserts an explicit
-    /// zero-extension or low-byte `SUBPIECE` for a directly stored value.
-    fn lower_expr_with_size(
-        &mut self,
-        expr: &Expression,
-        size: usize,
-    ) -> Result<Varnode, PcodeLowerError> {
-        // SLEIGH integer literals are polymorphic in raw p-code: the
-        // surrounding operation determines their varnode width (for example
-        // `RAX + 1`). This applies even when parsing retained a literal's
-        // minimal source width.
-        if let ExpressionTy::SizedInt { value, .. } = &expr.ty {
-            return Ok(Varnode::constant(*value, size));
-        }
-        if self.expr_size(expr) == Some(size) {
-            return self.lower_expr(expr, None);
-        }
-        let output = self.allocate_unique(size)?;
-        self.lower_expr(expr, Some(output))
-    }
-
-    fn lower_range(
-        &mut self,
-        range: &Range,
-        requested_output: Option<Varnode>,
-    ) -> Result<Varnode, PcodeLowerError> {
-        let input = self.lower_expr(&range.value, None)?;
-        let (start, bits) = Self::range_params(range)?;
-        self.extract_range(input, start, bits, requested_output)
-    }
-
-    fn lower_named_bitrange(
-        &mut self,
-        id: BitRangeFieldId,
-        requested_output: Option<Varnode>,
-    ) -> Result<Varnode, PcodeLowerError> {
-        let info = self
-            .context
-            .bitrange_info(id)
-            .ok_or(PcodeLowerError::Unsupported("an unknown named bit range"))?;
-        self.extract_range(info.storage, info.start, info.size, requested_output)
-    }
-
-    fn extract_range(
-        &mut self,
-        input: Varnode,
-        start: usize,
-        bits: usize,
-        requested_output: Option<Varnode>,
-    ) -> Result<Varnode, PcodeLowerError> {
-        let result_size = Self::validate_range(input, start, bits)?;
-        if let Some(output) = requested_output {
-            if output.size != result_size {
-                return Err(PcodeLowerError::CopySizeMismatch {
-                    input: result_size,
-                    output: output.size,
-                });
-            }
-        }
-        let shifted = self.allocate_unique(input.size)?;
-        self.ops.push(PcodeOp::new(
-            Opcode::IntRight,
-            Some(shifted),
-            vec![input, Varnode::constant(start as u64, input.size)],
-        ));
-        let masked = self.allocate_unique(input.size)?;
-        self.ops.push(PcodeOp::new(
-            Opcode::IntAnd,
-            Some(masked),
-            vec![shifted, Varnode::constant(Self::mask(bits)?, input.size)],
-        ));
-        let output = self.output(requested_output, result_size)?;
-        self.ops.push(PcodeOp::new(
-            Opcode::SubPiece,
-            Some(output),
-            vec![masked, Varnode::constant(0, 8)],
-        ));
-        Ok(output)
-    }
-
-    fn lower_range_assignment(
-        &mut self,
-        range: &Range,
-        rhs: &Expression,
-    ) -> Result<(), PcodeLowerError> {
-        if let ExpressionTy::Load(load) = &range.value.ty {
-            return self.lower_load_range_assignment(load, range, rhs);
-        }
-        let storage = self.storage_from_expr(&range.value)?;
-        let (start, bits) = Self::range_params(range)?;
-        self.insert_range(storage, start, bits, rhs)
-    }
-
-    /// Lowers a bit-range write into a memory load as load/modify/store. SLEIGH
-    /// uses this form for packed MMX lanes backed by private RAM, where an
-    /// address-of expression cannot name a raw-p-code varnode directly.
-    fn lower_load_range_assignment(
-        &mut self,
-        load: &Load,
-        range: &Range,
-        rhs: &Expression,
-    ) -> Result<(), PcodeLowerError> {
-        let storage = self.lower_load(&range.value, load, None)?;
-        let (start, bits) = Self::range_params(range)?;
-        Self::validate_range(storage, start, bits)?;
-        if storage.size > 8 {
-            return Err(PcodeLowerError::InvalidRange {
-                start,
-                size: bits,
-                storage_bits: storage.size.saturating_mul(8),
-            });
-        }
-        let value = self.lower_expr_with_size(rhs, bits.div_ceil(8))?;
-        if value.size > storage.size {
-            return Err(PcodeLowerError::InputSizeMismatch {
-                operation: "bit-range assignment",
-                left: storage.size,
-                right: value.size,
-            });
-        }
-        let extended = if value.size == storage.size {
-            value
-        } else {
-            let output = self.allocate_unique(storage.size)?;
-            self.ops
-                .push(PcodeOp::new(Opcode::IntZext, Some(output), vec![value]));
-            output
-        };
-        let inserted = self.allocate_unique(storage.size)?;
-        self.ops.push(PcodeOp::new(
-            Opcode::IntAnd,
-            Some(inserted),
-            vec![extended, Varnode::constant(Self::mask(bits)?, storage.size)],
-        ));
-        let shifted = self.allocate_unique(storage.size)?;
-        self.ops.push(PcodeOp::new(
-            Opcode::IntLeft,
-            Some(shifted),
-            vec![inserted, Varnode::constant(start as u64, storage.size)],
-        ));
-        let clear_mask = !(Self::mask(bits)? << start);
-        let kept = self.allocate_unique(storage.size)?;
-        self.ops.push(PcodeOp::new(
-            Opcode::IntAnd,
-            Some(kept),
-            vec![storage, Varnode::constant(clear_mask, storage.size)],
-        ));
-        let result = self.allocate_unique(storage.size)?;
-        self.ops.push(PcodeOp::new(
-            Opcode::IntOr,
-            Some(result),
-            vec![kept, shifted],
-        ));
-
-        let space = self.load_space(load)?;
-        if space == SPACE_CONST {
-            return Err(PcodeLowerError::Unsupported("a store to constant space"));
-        }
-        let ptr = self.lower_expr(&load.ptr, None)?;
-        self.validate_pointer(space, ptr)?;
-        self.ops.push(PcodeOp::new(
-            Opcode::Store,
-            None,
-            vec![Self::space_id(space), ptr, result],
-        ));
-        Ok(())
-    }
-
-    fn insert_range(
-        &mut self,
-        storage: Varnode,
-        start: usize,
-        bits: usize,
-        rhs: &Expression,
-    ) -> Result<(), PcodeLowerError> {
-        Self::validate_range(storage, start, bits)?;
-        // Inserting needs a full-width clear mask. Constants in this AST are
-        // u64, so zero-extending one into larger storage would incorrectly
-        // clear every high bit.
-        if storage.size > 8 {
-            return Err(PcodeLowerError::InvalidRange {
-                start,
-                size: bits,
-                storage_bits: storage.size.saturating_mul(8),
-            });
-        }
-        // A range assignment fixes the RHS width even when the RHS is a
-        // user-op result whose source expression does not carry one.
-        let value = self.lower_expr_with_size(rhs, bits.div_ceil(8))?;
-        if value.size > storage.size {
-            return Err(PcodeLowerError::InputSizeMismatch {
-                operation: "bit-range assignment",
-                left: storage.size,
-                right: value.size,
-            });
-        }
-        let extended = if value.size == storage.size {
-            value
-        } else {
-            let output = self.allocate_unique(storage.size)?;
-            self.ops
-                .push(PcodeOp::new(Opcode::IntZext, Some(output), vec![value]));
-            output
-        };
-        let inserted = self.allocate_unique(storage.size)?;
-        self.ops.push(PcodeOp::new(
-            Opcode::IntAnd,
-            Some(inserted),
-            vec![extended, Varnode::constant(Self::mask(bits)?, storage.size)],
-        ));
-        let shifted = self.allocate_unique(storage.size)?;
-        self.ops.push(PcodeOp::new(
-            Opcode::IntLeft,
-            Some(shifted),
-            vec![inserted, Varnode::constant(start as u64, storage.size)],
-        ));
-        let clear_mask = !(Self::mask(bits)? << start);
-        let kept = self.allocate_unique(storage.size)?;
-        self.ops.push(PcodeOp::new(
-            Opcode::IntAnd,
-            Some(kept),
-            vec![storage, Varnode::constant(clear_mask, storage.size)],
-        ));
-        self.ops.push(PcodeOp::new(
-            Opcode::IntOr,
-            Some(storage),
-            vec![kept, shifted],
-        ));
-        Ok(())
-    }
-
-    fn range_params(range: &Range) -> Result<(usize, usize), PcodeLowerError> {
-        let RangeParam::Literal(start) = range.start else {
-            return Err(PcodeLowerError::UnresolvedRangeParameter);
-        };
-        let RangeParam::Literal(size) = range.size else {
-            return Err(PcodeLowerError::UnresolvedRangeParameter);
-        };
-        Ok((start, size))
-    }
-
-    fn validate_range(
-        storage: Varnode,
-        start: usize,
-        size: usize,
-    ) -> Result<usize, PcodeLowerError> {
-        let storage_bits = storage
-            .size
-            .checked_mul(8)
-            .ok_or(PcodeLowerError::InvalidRange {
-                start,
-                size,
-                storage_bits: usize::MAX,
-            })?;
-        if size == 0 || size > 64 || start.checked_add(size).is_none_or(|end| end > storage_bits) {
-            return Err(PcodeLowerError::InvalidRange {
-                start,
-                size,
-                storage_bits,
-            });
-        }
-        Ok(size.div_ceil(8))
-    }
-
-    fn mask(bits: usize) -> Result<u64, PcodeLowerError> {
-        match bits {
-            1..=63 => Ok((1u64 << bits) - 1),
-            64 => Ok(u64::MAX),
-            _ => Err(PcodeLowerError::InvalidRange {
-                start: 0,
-                size: bits,
-                storage_bits: 64,
-            }),
-        }
-    }
-
-    fn validate_pointer(&self, space: SpaceId, ptr: Varnode) -> Result<(), PcodeLowerError> {
-        let expected = self
-            .context
-            .address_size(space)
-            .ok_or(PcodeLowerError::UnresolvedSpace)?;
-        Self::checked_size(expected)?;
-        if ptr.size != expected {
-            return Err(PcodeLowerError::AddressSizeMismatch {
-                expected,
-                actual: ptr.size,
-            });
-        }
-        Ok(())
-    }
-
-    fn storage_from_expr(&mut self, expr: &Expression) -> Result<Varnode, PcodeLowerError> {
-        match &expr.ty {
-            ExpressionTy::Ident(ident) => self.storage_for_ident(ident.clone(), expr.size),
-            _ => Err(PcodeLowerError::Unsupported(
-                "address-of a non-varnode expression",
-            )),
-        }
-    }
-
-    fn storage_for_ident(
-        &mut self,
-        ident: Ident,
-        size: Option<usize>,
-    ) -> Result<Varnode, PcodeLowerError> {
-        match ident {
-            Ident::Register(id) => self
-                .context
-                .register_varnode(id)
-                .ok_or(PcodeLowerError::UnknownRegister(id)),
-            Ident::Named(id) => {
-                let size = self.local_sizes.get(&id).copied().or(size);
-                if let Some(varnode) = self.locals.get(&id) {
-                    if let Some(size) = size
-                        && size != varnode.size
-                    {
-                        return Err(PcodeLowerError::CopySizeMismatch {
-                            input: varnode.size,
-                            output: size,
-                        });
-                    }
-                    return Ok(*varnode);
-                }
-                let varnode = self.allocate_unique(size.ok_or(PcodeLowerError::UnknownSize)?)?;
-                self.locals.insert(id, varnode);
-                Ok(varnode)
-            }
-            Ident::BitRange(_) => Err(PcodeLowerError::Unsupported("a named bit range")),
-            Ident::Field(_) => Err(PcodeLowerError::UnresolvedIdentifier("field")),
-            Ident::Table(_) => Err(PcodeLowerError::UnresolvedIdentifier("table")),
-            Ident::Global(_) => Err(PcodeLowerError::UnresolvedIdentifier("global")),
-        }
-    }
-
-    fn load_space(&self, load: &Load) -> Result<SpaceId, PcodeLowerError> {
-        match &load.space {
-            None => Ok(self.context.default_space()),
-            Some(crate::PcodeSpaceRef::Resolved(space)) => Ok(*space),
-            Some(crate::PcodeSpaceRef::Deferred(_)) => Err(PcodeLowerError::UnresolvedSpace),
-        }
-    }
-
-    fn lower_userop_inputs(
-        &mut self,
-        id: PCodeOpId,
-        args: &[Expression],
-    ) -> Result<Vec<Varnode>, PcodeLowerError> {
-        let mut inputs = Vec::with_capacity(args.len() + 1);
-        inputs.push(Varnode::constant(usize::from(id) as u64, 4));
-        inputs.extend(
-            args.iter()
-                .map(|arg| self.lower_expr(arg, None))
-                .collect::<Result<Vec<_>, _>>()?,
-        );
-        Ok(inputs)
-    }
-
-    fn copy_if_requested(
-        &mut self,
-        input: Varnode,
-        requested_output: Option<Varnode>,
-    ) -> Result<Varnode, PcodeLowerError> {
-        match requested_output {
-            Some(output) if output != input && input.size == output.size => {
-                self.ops
-                    .push(PcodeOp::new(Opcode::Copy, Some(output), vec![input]));
-                Ok(output)
-            }
-            Some(output) if input.size < output.size => {
-                self.ops
-                    .push(PcodeOp::new(Opcode::IntZext, Some(output), vec![input]));
-                Ok(output)
-            }
-            Some(output) if input.size > output.size => {
-                self.ops.push(PcodeOp::new(
-                    Opcode::SubPiece,
-                    Some(output),
-                    vec![input, Varnode::constant(0, 8)],
-                ));
-                Ok(output)
-            }
-            Some(output) => Ok(output),
-            None => Ok(input),
-        }
-    }
-
-    fn output(
-        &mut self,
-        requested_output: Option<Varnode>,
-        size: usize,
-    ) -> Result<Varnode, PcodeLowerError> {
-        match requested_output {
-            Some(output) => {
-                Self::checked_size(output.size)?;
-                Ok(output)
-            }
-            None => self.allocate_unique(size),
-        }
-    }
-
-    fn allocate_unique(&mut self, size: usize) -> Result<Varnode, PcodeLowerError> {
-        Self::checked_size(size)?;
-        let offset = self.next_unique;
-        self.next_unique = self
-            .next_unique
-            .checked_add(size as u64)
-            .ok_or(PcodeLowerError::UniqueSpaceOverflow)?;
-        Ok(Varnode::new(self.context.unique_space(), offset, size))
-    }
-
-    fn resolve_labels(&mut self) -> Result<(), PcodeLowerError> {
-        for (op_index, label) in &self.label_fixups {
-            let target = *self
-                .labels
-                .get(label)
-                .ok_or_else(|| PcodeLowerError::UnknownLabel(label.clone()))?;
-            let relative = i64::try_from(target)
-                .ok()
-                .and_then(|target| {
-                    i64::try_from(*op_index)
-                        .ok()
-                        .and_then(|source| target.checked_sub(source))
-                })
-                .ok_or(PcodeLowerError::UniqueSpaceOverflow)?;
-            self.ops[*op_index].inputs[0] = Varnode::constant(relative as u64, 8);
-        }
-        Ok(())
-    }
+    /// The width of a local variable, if it is known in this phase.
+    fn local_size(&self, id: &LocalVarId) -> Option<usize>;
 
     fn expr_size(&self, expr: &Expression) -> Option<usize> {
         expr.size.or(match &expr.ty {
             ExpressionTy::SizedInt { size, .. } => *size,
             ExpressionTy::Ident(Ident::Register(id)) => self
-                .context
+                .context()
                 .register_varnode(*id)
                 .map(|varnode| varnode.size),
             ExpressionTy::Ident(Ident::BitRange(id)) => self
-                .context
+                .context()
                 .bitrange_info(*id)
                 .map(|info| info.size.div_ceil(8)),
-            ExpressionTy::Ident(Ident::Named(id)) => self
-                .local_sizes
-                .get(id)
-                .copied()
-                .or_else(|| self.locals.get(id).map(|varnode| varnode.size)),
+            ExpressionTy::Ident(Ident::Named(id)) => self.local_size(id),
             ExpressionTy::Ident(Ident::Field(_))
             | ExpressionTy::Ident(Ident::Table(_))
             | ExpressionTy::Ident(Ident::Global(_)) => None,
@@ -1645,17 +1829,51 @@ impl<'a, C: PcodeLoweringContext + ?Sized> Lowerer<'a, C> {
         })
     }
 
-    fn checked_size(size: usize) -> Result<(), PcodeLowerError> {
-        if size == 0 {
-            Err(PcodeLowerError::ZeroSize)
-        } else {
-            Ok(())
+    fn storage_size(&self, ident: &Ident) -> Option<usize> {
+        match ident {
+            Ident::Register(id) => self
+                .context()
+                .register_varnode(*id)
+                .map(|varnode| varnode.size),
+            Ident::BitRange(id) => self
+                .context()
+                .bitrange_info(*id)
+                .map(|info| info.size.div_ceil(8)),
+            Ident::Named(id) => self.local_size(id),
+            Ident::Field(_) | Ident::Table(_) | Ident::Global(_) => None,
         }
     }
 
-    fn space_id(space: SpaceId) -> Varnode {
-        Varnode::constant(usize::from(space) as u64, 4)
+    fn storage_from_expr_size(&self, expr: &Expression) -> Option<Varnode> {
+        match &expr.ty {
+            ExpressionTy::Ident(Ident::Register(id)) => self.context().register_varnode(*id),
+            ExpressionTy::Ident(Ident::BitRange(id)) => {
+                self.context().bitrange_info(*id).map(|info| info.storage)
+            }
+            _ => None,
+        }
     }
+
+    fn load_space(&self, load: &Load) -> Result<SpaceId, PcodeLowerError> {
+        match &load.space {
+            None => Ok(self.context().default_space()),
+            Some(crate::PcodeSpaceRef::Resolved(space)) => Ok(*space),
+            Some(crate::PcodeSpaceRef::Deferred(_)) => Err(PcodeLowerError::UnresolvedSpace),
+        }
+    }
+}
+
+/// Reads a bit range's literal start and width.
+///
+/// A macro-argument range must have been substituted during expansion.
+fn range_params(range: &Range) -> Result<(usize, usize), PcodeLowerError> {
+    let RangeParam::Literal(start) = range.start else {
+        return Err(PcodeLowerError::UnresolvedRangeParameter);
+    };
+    let RangeParam::Literal(size) = range.size else {
+        return Err(PcodeLowerError::UnresolvedRangeParameter);
+    };
+    Ok((start, size))
 }
 
 fn binary_opcode(op: BinaryOperator) -> (Opcode, bool) {
@@ -1703,8 +1921,8 @@ fn binary_opcode(op: BinaryOperator) -> (Opcode, bool) {
 #[cfg(test)]
 mod tests {
     use super::{
-        BitRangeInfo, InstructionPcode, Opcode, PcodeLowerError, PcodeLoweringContext, PcodeOp,
-        Varnode, lower_instruction,
+        BitRangeInfo, InstructionPcode, LabelId, Opcode, PcodeLowerError, PcodeLoweringContext,
+        PcodeOp, PcodeSink, Varnode, emit_instruction, lower_instruction, plan_instruction,
     };
     use crate::{
         Ast, AstNode, BinaryOperator, Binop, Expression, ExpressionTy, Ident, LabelOrNode, Load,
@@ -1900,6 +2118,126 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    /// Records the events of a streaming lift, keeping local branches symbolic.
+    #[derive(Default)]
+    struct Trace {
+        events: Vec<String>,
+    }
+
+    impl PcodeSink for Trace {
+        fn op(&mut self, opcode: Opcode, output: Option<Varnode>, inputs: &[Varnode]) {
+            self.events
+                .push(format!("{opcode:?} {output:?} {inputs:?}"));
+        }
+
+        fn label(&mut self, label: LabelId) {
+            self.events.push(format!("label {}", label.index()));
+        }
+
+        fn branch_label(&mut self, opcode: Opcode, label: LabelId, condition: Option<Varnode>) {
+            self.events.push(format!(
+                "{opcode:?} -> label {} {condition:?}",
+                label.index()
+            ));
+        }
+    }
+
+    fn branch_statements() -> Vec<AstNode> {
+        vec![
+            AstNode::ConditionalBranch {
+                condition: ident(RegisterId::new(1)),
+                target: LabelOrNode::Label("skip".into()),
+            },
+            AstNode::Call {
+                target: LabelOrNode::Expr(int(0x2000, 8)),
+            },
+            AstNode::Branch {
+                target: LabelOrNode::Expr(int(0x1000, 8)),
+            },
+            AstNode::Label("skip".into()),
+            AstNode::Assignment {
+                lhs: Ident::Register(RegisterId::new(1)),
+                size: None,
+                rhs: ident(RegisterId::new(2)),
+            },
+        ]
+    }
+
+    #[test]
+    fn plan_reports_labels_and_out_of_instruction_targets() {
+        let plan = plan_instruction(&ast(branch_statements()), &Context).unwrap();
+        assert_eq!(plan.labels(), &[Box::<str>::from("skip")]);
+        assert_eq!(plan.direct_branches(), &[0x1000]);
+        assert_eq!(plan.direct_calls(), &[0x2000]);
+    }
+
+    #[test]
+    fn streaming_emission_keeps_local_branch_targets_symbolic() {
+        let ast = ast(branch_statements());
+        let plan = plan_instruction(&ast, &Context).unwrap();
+        let mut trace = Trace::default();
+        emit_instruction(&ast, &Context, &plan, &mut trace).unwrap();
+
+        assert_eq!(
+            trace.events[0],
+            "CBranch -> label 0 Some(Varnode { space: SpaceId(3), offset: 4, size: 4 })"
+        );
+        assert_eq!(trace.events[3], "label 0");
+        assert_eq!(trace.events.len(), 5);
+
+        // The collecting API resolves the same branch into a relative target.
+        let pcode = lower_instruction(&ast, &Context).unwrap();
+        assert_eq!(pcode.ops[0].opcode, Opcode::CBranch);
+        assert_eq!(pcode.ops[0].inputs[0], Varnode::constant(3, 8));
+    }
+
+    #[test]
+    fn plan_omits_unresolvable_direct_targets() {
+        let plan = plan_instruction(
+            &ast(vec![AstNode::Branch {
+                target: LabelOrNode::Expr(ident(RegisterId::new(1))),
+            }]),
+            &Context,
+        )
+        .unwrap();
+        assert!(plan.direct_branches().is_empty());
+        assert_eq!(
+            lower_instruction(
+                &ast(vec![AstNode::Branch {
+                    target: LabelOrNode::Expr(ident(RegisterId::new(1))),
+                }]),
+                &Context,
+            )
+            .unwrap_err(),
+            PcodeLowerError::InvalidDirectTarget
+        );
+    }
+
+    #[test]
+    fn branching_to_an_undefined_label_is_rejected() {
+        let error = lower_instruction(
+            &ast(vec![AstNode::Branch {
+                target: LabelOrNode::Label("missing".into()),
+            }]),
+            &Context,
+        )
+        .unwrap_err();
+        assert_eq!(error, PcodeLowerError::UnknownLabel("missing".into()));
+    }
+
+    #[test]
+    fn duplicate_labels_are_rejected() {
+        let error = lower_instruction(
+            &ast(vec![
+                AstNode::Label("here".into()),
+                AstNode::Label("here".into()),
+            ]),
+            &Context,
+        )
+        .unwrap_err();
+        assert_eq!(error, PcodeLowerError::DuplicateLabel("here".into()));
     }
 
     #[test]

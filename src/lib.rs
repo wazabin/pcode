@@ -26,8 +26,9 @@ pub use expression::{
     pretty_print_ident,
 };
 pub use instruction::{
-    BitRangeInfo, InstructionPcode, Opcode, PcodeLowerError, PcodeLoweringContext, PcodeOp,
-    Varnode, lower_instruction, lower_instruction_into,
+    BitRangeInfo, InstructionPcode, LabelId, Opcode, PcodeLowerError, PcodeLoweringContext,
+    PcodeOp, PcodePlan, PcodeSink, Varnode, emit_instruction, lower_instruction,
+    lower_instruction_into, plan_instruction,
 };
 pub use register::{Register, RegisterId, RegisterMutRef, RegisterRef};
 pub use space::{SPACE_CONST, Space, SpaceId, SpaceRef, SpaceStore, SpaceType};
