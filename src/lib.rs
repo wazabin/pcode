@@ -27,7 +27,7 @@ pub use expression::{
 };
 pub use instruction::{
     BitRangeInfo, InstructionPcode, Opcode, PcodeLowerError, PcodeLoweringContext, PcodeOp,
-    Varnode, lower_instruction,
+    Varnode, lower_instruction, lower_instruction_into,
 };
 pub use register::{Register, RegisterId, RegisterMutRef, RegisterRef};
 pub use space::{SPACE_CONST, Space, SpaceId, SpaceRef, SpaceStore, SpaceType};

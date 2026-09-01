@@ -430,7 +430,24 @@ pub fn lower_instruction(
     ast: &PcodeAst,
     context: &impl PcodeLoweringContext,
 ) -> Result<InstructionPcode, PcodeLowerError> {
-    Lowerer::new(context).lower(ast)
+    Ok(InstructionPcode {
+        ops: Lowerer::new(context).lower_ops(ast)?,
+    })
+}
+
+/// Lowers `ast` and exposes its resolved flat p-code to `sink` without
+/// materializing an [`InstructionPcode`] for the caller.
+///
+/// The lowerer still keeps operations temporarily while resolving local branch
+/// labels. Consumers which can process a complete instruction synchronously
+/// can therefore avoid making the flat p-code an owned boundary object.
+pub fn lower_instruction_into<R>(
+    ast: &PcodeAst,
+    context: &impl PcodeLoweringContext,
+    sink: impl FnOnce(&[PcodeOp]) -> R,
+) -> Result<R, PcodeLowerError> {
+    let ops = Lowerer::new(context).lower_ops(ast)?;
+    Ok(sink(&ops))
 }
 
 impl InstructionPcode {
@@ -469,13 +486,13 @@ impl<'a, C: PcodeLoweringContext + ?Sized> Lowerer<'a, C> {
         }
     }
 
-    fn lower(mut self, ast: &PcodeAst) -> Result<InstructionPcode, PcodeLowerError> {
+    fn lower_ops(mut self, ast: &PcodeAst) -> Result<Vec<PcodeOp>, PcodeLowerError> {
         self.infer_local_sizes(ast);
         for statement in &ast.statements {
             self.lower_statement(&statement.ty)?;
         }
         self.resolve_labels()?;
-        Ok(InstructionPcode { ops: self.ops })
+        Ok(self.ops)
     }
 
     /// Resolve local widths from their uses before emitting operations. A
