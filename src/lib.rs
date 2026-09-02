@@ -26,10 +26,10 @@ pub use expression::{
     pretty_print_ident,
 };
 pub use instruction::{
-    BitRangeInfo, InstructionPcode, LabelId, LocalSizes, Opcode, OperandKey, PcodeLowerError,
+    BitRangeInfo, BodyWidths, InstructionPcode, LabelId, LocalSizes, Opcode, PcodeLowerError,
     PcodeLoweringContext, PcodeOp, PcodePlan, PcodeSink, SymbolicWidth, Varnode, Width,
     emit_instruction, infer_local_sizes, lower_instruction, lower_instruction_into,
-    plan_instruction, plan_instruction_with,
+    plan_instruction, plan_instruction_with, resolve_body_widths,
 };
 pub use register::{Register, RegisterId, RegisterMutRef, RegisterRef};
 pub use space::{SPACE_CONST, Space, SpaceId, SpaceRef, SpaceStore, SpaceType};

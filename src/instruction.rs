@@ -6,9 +6,9 @@
 //! these operations by allocating temporaries in its unique space.
 
 use crate::{
-    Ast, AstNode, BinaryOperator, BitRangeFieldId, Builtin, Expression, ExpressionTy, FieldId,
-    Ident, LabelOrNode, Load, LocalVarId, PCodeOpId, PcodeAst, Range, RangeParam, RegisterId,
-    SPACE_CONST, SpaceId, TableId, UnaryOperator,
+    Ast, AstNode, BinaryOperator, BitRangeFieldId, Builtin, Expression, ExpressionTy, Ident,
+    LabelOrNode, Load, LocalVarId, PCodeOpId, PcodeAst, Range, RangeParam, RegisterId, SPACE_CONST,
+    SpaceId, TableId, UnaryOperator,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -621,9 +621,13 @@ pub trait Width: Copy + Eq + std::fmt::Debug {
     /// wrong one.
     fn size(self) -> Option<usize>;
 
-    /// The width of the value an operand supplies, if this domain can name
-    /// it. Concrete domains cannot, and report the width as unknown.
-    fn operand(_key: OperandKey) -> Option<Self> {
+    /// The width of the value a sub-table operand exports, if this domain can
+    /// name it. Concrete domains cannot, and report the width as unknown.
+    ///
+    /// Only a table operand is nameable. A decoder field substitutes an
+    /// integer literal, and a literal deliberately establishes no width, so
+    /// naming one would claim a width the per-instruction pass never infers.
+    fn operand(_table: TableId) -> Option<Self> {
         None
     }
 }
@@ -638,22 +642,13 @@ impl Width for usize {
     }
 }
 
-/// An operand whose value a decode substitutes into a p-code body.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum OperandKey {
-    /// A sub-table operand, which supplies its constructor's exported value.
-    Table(TableId),
-    /// A decoder field, which supplies the constant this encoding gave it.
-    Field(FieldId),
-}
-
 /// A width resolved before decoding, which may still name an operand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SymbolicWidth {
     /// A concrete width in bytes.
     Fixed(usize),
-    /// The width of the value an operand supplies.
-    SameAs(OperandKey),
+    /// The width of the value a sub-table operand exports.
+    SameAs(TableId),
 }
 
 impl Width for SymbolicWidth {
@@ -668,13 +663,121 @@ impl Width for SymbolicWidth {
         }
     }
 
-    fn operand(key: OperandKey) -> Option<Self> {
-        Some(Self::SameAs(key))
+    fn operand(table: TableId) -> Option<Self> {
+        Some(Self::SameAs(table))
     }
 }
 
 /// Widths, in bytes, of the local variables of one p-code body.
 pub type LocalSizes = HashMap<LocalVarId, usize>;
+
+/// The widths of one p-code body, and the locals that have none.
+#[derive(Debug, Clone, Default)]
+pub struct BodyWidths<W> {
+    /// Resolved widths, keyed by the body's own local ids.
+    pub widths: HashMap<LocalVarId, W>,
+    /// Locals the body uses but no width could be resolved for, in id order.
+    ///
+    /// In a symbolic domain these are unsizable by *any* decode — nothing a
+    /// producer substitutes can give them a width — so they are a defect in
+    /// the body rather than a limitation of this pass.
+    pub unsized_locals: Vec<LocalVarId>,
+}
+
+impl<W> BodyWidths<W> {
+    /// Whether every local the body uses has a width.
+    pub fn is_complete(&self) -> bool {
+        self.unsized_locals.is_empty()
+    }
+}
+
+/// Resolves the widths of a body's locals and reports the ones with none.
+///
+/// Unlike [`infer_local_sizes`] this also visits the body to find which locals
+/// it actually uses, so a caller can tell a width it failed to resolve from an
+/// id that no statement mentions. A body's `local_var_count` is a high-water
+/// mark of the id space after macro inlining, not its live set.
+pub fn resolve_body_widths<S, W: Width>(
+    statements: &[Ast<S>],
+    context: &impl PcodeLoweringContext,
+) -> BodyWidths<W> {
+    let widths: HashMap<LocalVarId, W> = SizeInference::run(context, statements);
+    let mut used = Vec::new();
+    live_locals(statements, &mut used);
+    used.sort_unstable_by_key(|id| id.0);
+    used.dedup();
+    let unsized_locals = used
+        .into_iter()
+        .filter(|id| !widths.contains_key(id))
+        .collect();
+    BodyWidths {
+        widths,
+        unsized_locals,
+    }
+}
+
+/// Collects the locals `statements` reads or writes.
+fn live_locals<S>(statements: &[Ast<S>], out: &mut Vec<LocalVarId>) {
+    fn walk_expr<S>(value: &Expression<S>, out: &mut Vec<LocalVarId>) {
+        match &value.ty {
+            ExpressionTy::Ident(Ident::Named(id)) => out.push(*id),
+            ExpressionTy::Ident(_) | ExpressionTy::SizedInt { .. } => {}
+            ExpressionTy::Load(load) => walk_expr(&load.ptr, out),
+            ExpressionTy::Range(range) => walk_expr(&range.value, out),
+            ExpressionTy::SubPieceLsb { src, .. } | ExpressionTy::SubPieceMsb { src, .. } => {
+                walk_expr(src, out);
+            }
+            ExpressionTy::FunctionCall { args, .. }
+            | ExpressionTy::PcodeOp { args, .. }
+            | ExpressionTy::MacroCall { args, .. }
+            | ExpressionTy::DeferredCall { args, .. } => {
+                args.iter().for_each(|arg| walk_expr(arg, out));
+            }
+            ExpressionTy::Unop(unop) => walk_expr(&unop.e, out),
+            ExpressionTy::Binop(binop) => {
+                walk_expr(&binop.lhs, out);
+                walk_expr(&binop.rhs, out);
+            }
+        }
+    }
+    fn walk_target<S>(target: &LabelOrNode<S>, out: &mut Vec<LocalVarId>) {
+        if let LabelOrNode::Expr(value) = target {
+            walk_expr(value, out);
+        }
+    }
+    for statement in statements {
+        match &statement.ty {
+            AstNode::Assignment { lhs, rhs, .. } => {
+                if let Ident::Named(id) = lhs {
+                    out.push(*id);
+                }
+                walk_expr(rhs, out);
+            }
+            AstNode::LoadAssignment { lhs, rhs, .. } => {
+                walk_expr(&lhs.ptr, out);
+                walk_expr(rhs, out);
+            }
+            AstNode::RangeAssignment { lhs, rhs, .. } => {
+                walk_expr(&lhs.value, out);
+                walk_expr(rhs, out);
+            }
+            AstNode::Branch { target } | AstNode::Call { target } => walk_target(target, out),
+            AstNode::ConditionalBranch { target, condition } => {
+                walk_target(target, out);
+                walk_expr(condition, out);
+            }
+            AstNode::BranchIndirect { target: value }
+            | AstNode::CallIndirect { target: value }
+            | AstNode::Return { target: value }
+            | AstNode::Expression(value)
+            | AstNode::Export(value) => walk_expr(value, out),
+            AstNode::Label(_)
+            | AstNode::Build(_)
+            | AstNode::DeferredBuild(_)
+            | AstNode::DelaySlot(_) => {}
+        }
+    }
+}
 
 /// Infers the local-variable widths of a *source* p-code body.
 ///
@@ -2038,11 +2141,10 @@ trait Sizing<W: Width> {
                 .bitrange_info(*id)
                 .map(|info| W::fixed(info.size.div_ceil(8))),
             Ident::Named(id) => self.local_size(id),
-            // An operand's width is only known once a decode substitutes its
-            // value. A symbolic domain names it instead of losing it.
-            Ident::Table(id) => W::operand(OperandKey::Table(*id)),
-            Ident::Field(id) => W::operand(OperandKey::Field(*id)),
-            Ident::Global(_) => None,
+            // A table operand's width is only known once a decode substitutes
+            // its export. A symbolic domain names it instead of losing it.
+            Ident::Table(id) => W::operand(*id),
+            Ident::Field(_) | Ident::Global(_) => None,
         }
     }
 
@@ -2442,9 +2544,7 @@ mod tests {
             super::infer_local_sizes(&statements, &Context);
         assert_eq!(
             symbolic.get(&LocalVarId(0)),
-            Some(&super::SymbolicWidth::SameAs(super::OperandKey::Table(
-                table
-            )))
+            Some(&super::SymbolicWidth::SameAs(table))
         );
 
         // The concrete domain cannot name it, so it falls through to the
