@@ -1,8 +1,13 @@
 # wazabin-pcode
 
+[![CI](https://github.com/wazabin/pcode/actions/workflows/ci.yml/badge.svg)](https://github.com/wazabin/pcode/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/wazabin-pcode.svg)](https://crates.io/crates/wazabin-pcode)
+
 Shared vocabulary and source-shaped SLEIGH p-code AST types for producers and
 consumers. It covers address spaces, registers, expression and statement ASTs,
 operators, builtins, diagnostics, and user-defined operation identifiers.
+
+Developed by [Thalium](https://blog.thalium.re/about/).
 
 ## Scope
 
@@ -23,11 +28,11 @@ decoder implementation.
 
 ## Development
 
-The current development setup requires a sibling checkout of `jstd`:
+The current development setup requires a sibling checkout of `wazabin-jstd`:
 
 ```text
 parent/
-├── jstd/
+├── wazabin-jstd/
 └── wazabin-pcode/
 ```
 

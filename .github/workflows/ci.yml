@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+    branches: [main]
 
 permissions:
   contents: read
@@ -12,8 +14,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Override this repository variable when jstd is hosted somewhere other than
-  # <this repository owner>/jstd.
+  # Override this repository variable when wazabin-jstd is hosted elsewhere.
   JSTD_REPOSITORY: ${{ vars.JSTD_REPOSITORY || format('{0}/jstd', github.repository_owner) }}
 
 jobs:
@@ -21,25 +22,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Check out unpublished dependency
+      - name: Check out wazabin-jstd
         run: |
           git clone --depth=1 "https://github.com/${JSTD_REPOSITORY}.git" \
-            "$GITHUB_WORKSPACE/../jstd"
+            "$GITHUB_WORKSPACE/../wazabin-jstd"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-features
+      - run: cargo doc --no-deps
 
   coverage:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Check out unpublished dependency
+      - name: Check out wazabin-jstd
         run: |
           git clone --depth=1 "https://github.com/${JSTD_REPOSITORY}.git" \
-            "$GITHUB_WORKSPACE/../jstd"
+            "$GITHUB_WORKSPACE/../wazabin-jstd"
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-llvm-cov
       - run: cargo llvm-cov --all-features --fail-under-lines 75 --lcov --output-path lcov.info
