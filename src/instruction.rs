@@ -1212,8 +1212,13 @@ impl<'a, 'p, 's, C: PcodeLoweringContext + ?Sized, S: PcodeSink + ?Sized>
         let size = requested_output
             .map(|output| output.size)
             .or(expr.size)
-            .or(match builtin {
+            .or_else(|| match builtin {
                 Builtin::Carry | Builtin::Scarry | Builtin::Sborrow | Builtin::Nan => Some(1),
+                // The width-preserving float builtins answer in their operand's
+                // width, so `trunc(round(XmmReg2[0,32]))` needs no local.
+                Builtin::Abs | Builtin::Sqrt | Builtin::Floor | Builtin::Ceil | Builtin::Round => {
+                    args.first().and_then(|arg| self.expr_size(arg))
+                }
                 _ => None,
             })
             .ok_or(PcodeLowerError::UnknownSize)?;
@@ -3018,6 +3023,50 @@ mod tests {
                 "{start},{size}"
             );
         }
+    }
+
+    #[test]
+    fn lower_gives_width_preserving_float_builtins_their_operand_width() {
+        // r0 = trunc(round(r1[0,32])) with no width on the round() node.
+        let pcode = lower_instruction(
+            &ast(vec![AstNode::Assignment {
+                lhs: Ident::Register(RegisterId::new(0)),
+                size: None,
+                rhs: Expression {
+                    ty: ExpressionTy::FunctionCall {
+                        builtin: crate::Builtin::Trunc,
+                        args: vec![Expression {
+                            ty: ExpressionTy::FunctionCall {
+                                builtin: crate::Builtin::Round,
+                                args: vec![Expression {
+                                    ty: ExpressionTy::Range(crate::Range {
+                                        value: Box::new(ident(RegisterId::new(1))),
+                                        start: crate::RangeParam::Literal(0),
+                                        size: crate::RangeParam::Literal(32),
+                                    }),
+                                    size: Some(4),
+                                    span: (),
+                                }],
+                            },
+                            size: None,
+                            span: (),
+                        }],
+                    },
+                    size: None,
+                    span: (),
+                },
+            }]),
+            &Context,
+        )
+        .unwrap();
+        let round = pcode
+            .ops
+            .iter()
+            .find(|op| op.opcode == Opcode::FloatRound)
+            .expect("round was emitted");
+        assert_eq!(round.output.unwrap().size, 4);
+        assert_eq!(pcode.ops.last().unwrap().opcode, Opcode::FloatTrunc);
+        assert_eq!(pcode.ops.last().unwrap().output.unwrap().size, 4);
     }
 
     #[test]
