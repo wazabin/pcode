@@ -17,6 +17,9 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+
       - name: Verify tag matches package version
         run: |
           version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; packages = json.load(sys.stdin)["packages"]; print(next(package["version"] for package in packages if package["name"] == "wazabin-pcode"))')"
@@ -28,10 +31,14 @@ jobs:
           echo "RELEASE_VERSION=$version" >> "$GITHUB_ENV"
 
       - name: Publish wazabin-pcode
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
-          if cargo publish; then
+          if output="$(cargo publish 2>&1)"; then
+            echo "$output"
             exit 0
           fi
 
+          echo "$output"
           # Permit a manual re-run after this version has already uploaded.
-          cargo info "wazabin-pcode@$RELEASE_VERSION" >/dev/null 2>&1
+          grep -q 'crate version .* is already uploaded' <<<"$output"
