@@ -1491,11 +1491,45 @@ impl<'a, 'p, 's, C: PcodeLoweringContext + ?Sized, S: PcodeSink + ?Sized>
         let (start, bits) = range_params(range)?;
         Self::validate_range(storage, start, bits)?;
         if storage.size > 8 {
-            return Err(PcodeLowerError::InvalidRange {
-                start,
-                size: bits,
-                storage_bits: storage.size.saturating_mul(8),
-            });
+            // A byte-aligned lane of a wide memory operand is stored on its
+            // own at `ptr + start / 8`; the surrounding bytes are untouched.
+            let Some(lane) = Self::aligned_lane(storage, start, bits) else {
+                return Err(PcodeLowerError::InvalidRange {
+                    start,
+                    size: bits,
+                    storage_bits: storage.size.saturating_mul(8),
+                });
+            };
+            let value = self.lower_expr_with_size(rhs, lane.size)?;
+            if value.size != lane.size {
+                return Err(PcodeLowerError::CopySizeMismatch {
+                    input: value.size,
+                    output: lane.size,
+                });
+            }
+            let space = self.load_space(load)?;
+            if space == SPACE_CONST {
+                return Err(PcodeLowerError::Unsupported("a store to constant space"));
+            }
+            let ptr = self.lower_expr(&load.ptr, None)?;
+            self.validate_pointer(space, ptr)?;
+            let lane_ptr = if start == 0 {
+                ptr
+            } else {
+                let output = self.allocate_unique(ptr.size)?;
+                self.emit(
+                    Opcode::IntAdd,
+                    Some(output),
+                    &[ptr, Varnode::constant((start / 8) as u64, ptr.size)],
+                );
+                output
+            };
+            self.emit(
+                Opcode::Store,
+                None,
+                &[Self::space_id(space), lane_ptr, value],
+            );
+            return Ok(());
         }
         let value = self.lower_expr_with_size(rhs, bits.div_ceil(8))?;
         if value.size > storage.size {
@@ -1554,13 +1588,26 @@ impl<'a, 'p, 's, C: PcodeLoweringContext + ?Sized, S: PcodeSink + ?Sized>
         Self::validate_range(storage, start, bits)?;
         // Inserting needs a full-width clear mask. Constants in this AST are
         // u64, so zero-extending one into larger storage would incorrectly
-        // clear every high bit.
+        // clear every high bit. A byte-aligned lane of wide storage (an XMM
+        // register, or a 16-byte local) is instead written as the sub-varnode
+        // it names, which is how SLEIGH itself models overlapping registers.
         if storage.size > 8 {
-            return Err(PcodeLowerError::InvalidRange {
-                start,
-                size: bits,
-                storage_bits: storage.size.saturating_mul(8),
-            });
+            let Some(lane) = Self::aligned_lane(storage, start, bits) else {
+                return Err(PcodeLowerError::InvalidRange {
+                    start,
+                    size: bits,
+                    storage_bits: storage.size.saturating_mul(8),
+                });
+            };
+            let value = self.lower_expr_with_size(rhs, lane.size)?;
+            if value.size != lane.size {
+                return Err(PcodeLowerError::CopySizeMismatch {
+                    input: value.size,
+                    output: lane.size,
+                });
+            }
+            self.emit(Opcode::Copy, Some(lane), &[value]);
+            return Ok(());
         }
         // A range assignment fixes the RHS width even when the RHS is a
         // user-op result whose source expression does not carry one.
@@ -1600,6 +1647,19 @@ impl<'a, 'p, 's, C: PcodeLoweringContext + ?Sized, S: PcodeSink + ?Sized>
         );
         self.emit(Opcode::IntOr, Some(storage), &[kept, shifted]);
         Ok(())
+    }
+
+    /// The sub-varnode a byte-aligned bit range of `storage` names, or `None`
+    /// when the range does not start and end on a byte boundary.
+    fn aligned_lane(storage: Varnode, start: usize, bits: usize) -> Option<Varnode> {
+        if start % 8 != 0 || bits % 8 != 0 {
+            return None;
+        }
+        Some(Varnode::new(
+            storage.space,
+            storage.offset + (start / 8) as u64,
+            bits / 8,
+        ))
     }
 
     fn validate_range(
@@ -2838,6 +2898,126 @@ mod tests {
             .find(|op| op.opcode == Opcode::CallOther)
             .expect("range-assignment user-op was emitted");
         assert_eq!(userop.output.unwrap().size, 1);
+    }
+
+    /// A context with one 16-byte register, register 9, next to the 4-byte ones.
+    struct WideContext;
+
+    impl PcodeLoweringContext for WideContext {
+        fn default_space(&self) -> SpaceId {
+            SpaceId::new(1)
+        }
+
+        fn unique_space(&self) -> SpaceId {
+            SpaceId::new(2)
+        }
+
+        fn register_varnode(&self, id: RegisterId) -> Option<Varnode> {
+            if usize::from(id) == 9 {
+                Some(Varnode::new(SpaceId::new(3), 0x100, 16))
+            } else {
+                Some(Varnode::new(SpaceId::new(3), usize::from(id) as u64 * 4, 4))
+            }
+        }
+
+        fn bitrange_info(&self, _id: crate::BitRangeFieldId) -> Option<BitRangeInfo> {
+            None
+        }
+
+        fn address_size(&self, _space: SpaceId) -> Option<usize> {
+            Some(8)
+        }
+    }
+
+    fn wide_lane_assignment(start: usize, size: usize, rhs: Expression) -> AstNode {
+        AstNode::RangeAssignment {
+            lhs: Range {
+                value: Box::new(Expression {
+                    ty: ExpressionTy::Ident(Ident::Register(RegisterId::new(9))),
+                    size: Some(16),
+                    span: (),
+                }),
+                start: RangeParam::Literal(start),
+                size: RangeParam::Literal(size),
+            },
+            size: None,
+            rhs,
+        }
+    }
+
+    #[test]
+    fn lower_writes_an_aligned_lane_of_wide_storage_as_its_sub_varnode() {
+        // XmmReg[32,32] = r0 on a 16-byte register: one copy into bytes 4..8.
+        let pcode = lower_instruction(
+            &ast(vec![wide_lane_assignment(
+                32,
+                32,
+                ident(RegisterId::new(0)),
+            )]),
+            &WideContext,
+        )
+        .unwrap();
+        assert_eq!(pcode.ops.len(), 1);
+        assert_eq!(pcode.ops[0].opcode, Opcode::Copy);
+        assert_eq!(
+            pcode.ops[0].output,
+            Some(Varnode::new(SpaceId::new(3), 0x104, 4))
+        );
+        assert_eq!(
+            pcode.ops[0].inputs,
+            vec![Varnode::new(SpaceId::new(3), 0, 4)]
+        );
+    }
+
+    #[test]
+    fn lower_writes_an_aligned_lane_of_a_wide_memory_operand_as_a_narrow_store() {
+        // *:16 (0x2000)[64,32] = r0 stores four bytes at 0x2008.
+        let pcode = lower_instruction(
+            &ast(vec![AstNode::RangeAssignment {
+                lhs: Range {
+                    value: Box::new(Expression {
+                        ty: ExpressionTy::Load(Load {
+                            space: None,
+                            size: Some(16),
+                            ptr: Box::new(int(0x2000, 8)),
+                        }),
+                        size: Some(16),
+                        span: (),
+                    }),
+                    start: RangeParam::Literal(64),
+                    size: RangeParam::Literal(32),
+                },
+                size: None,
+                rhs: ident(RegisterId::new(0)),
+            }]),
+            &WideContext,
+        )
+        .unwrap();
+        let store = pcode.ops.last().unwrap();
+        assert_eq!(store.opcode, Opcode::Store);
+        assert_eq!(store.inputs[2], Varnode::new(SpaceId::new(3), 0, 4));
+        let add = pcode
+            .ops
+            .iter()
+            .find(|op| op.opcode == Opcode::IntAdd)
+            .expect("the lane pointer is offset from the operand pointer");
+        assert_eq!(add.inputs[1], Varnode::constant(8, 8));
+        assert_eq!(store.inputs[1], add.output.unwrap());
+    }
+
+    #[test]
+    fn lower_still_rejects_an_unaligned_lane_of_wide_storage() {
+        for (start, size) in [(4, 32), (0, 12), (127, 1)] {
+            let error = lower_instruction(
+                &ast(vec![wide_lane_assignment(start, size, int(1, 1))]),
+                &WideContext,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, PcodeLowerError::InvalidRange { .. }),
+                "{start},{size}"
+            );
+        }
     }
 
     #[test]
