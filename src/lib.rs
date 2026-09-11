@@ -11,6 +11,49 @@
 //! serialized form is part of the producer/consumer compatibility contract.
 //! A producer must version its blob format; serde alone does not provide a
 //! cross-version or cross-platform wire-format guarantee.
+//!
+//! # Example
+//!
+//! The vocabulary is plain data. A consumer names its spaces and registers,
+//! and a producer's varnodes refer to them by id.
+//!
+//! ```
+//! use jstd::registry::Registry;
+//! use pcode_types::{
+//!     Register, SpaceType,
+//!     space::{Space, SpaceId, SpaceStore},
+//! };
+//!
+//! struct MySpecification {
+//!     spaces: Registry<SpaceId, Space>,
+//! }
+//!
+//! impl SpaceStore for MySpecification {
+//!     fn spaces(&self) -> &Registry<SpaceId, Space> {
+//!         &self.spaces
+//!     }
+//! }
+//!
+//! let mut spaces = Registry::default();
+//! // A byte-addressed 64-bit RAM space, and the space registers live in.
+//! let ram = spaces.push(Space::new(Some("ram"), 1, 8));
+//! let register_space = spaces.push(Space::new(Some("register"), 1, 8));
+//! let spec = MySpecification { spaces };
+//!
+//! // `from_id` resolves against any `SpaceStore`, including your own context.
+//! let resolved = Space::from_id(&spec, ram);
+//! assert_eq!(resolved.name.as_deref(), Some("ram"));
+//! assert!(matches!(resolved.ty, SpaceType::Ram));
+//!
+//! // An 8-byte register at offset 0 of the register space.
+//! let rax = Register {
+//!     name: "RAX".into(),
+//!     space: register_space,
+//!     offset: 0,
+//!     size: 8,
+//! };
+//! assert_eq!(&*rax.name, "RAX");
+//! ```
 
 pub mod error;
 pub mod expression;
