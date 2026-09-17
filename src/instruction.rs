@@ -4,11 +4,16 @@
 //! varnodes. They deliberately complement, rather than replace, the
 //! source-shaped [`crate::PcodeAst`]. A producer lowers nested expressions to
 //! these operations by allocating temporaries in its unique space.
+//!
+//! [`lower_instruction`], [`plan_instruction`] and [`emit_instruction`] lower
+//! an owned AST. The passes behind them are also exposed one statement at a
+//! time, for a producer that never builds that AST; see [`crate::streaming`].
 
 use crate::{
     Ast, AstNode, BinaryOperator, BitRangeFieldId, Builtin, Expression, ExpressionTy, Ident,
-    LabelOrNode, Load, LocalVarId, PCodeOpId, PcodeAst, Range, RangeParam, RegisterId, SPACE_CONST,
-    SpaceId, TableId, UnaryOperator,
+    LabelOrNode, LocalVarId, PCodeOpId, PcodeAst, RangeParam, RegisterId, SPACE_CONST, SpaceId,
+    TableId, UnaryOperator,
+    streaming::{ExprKind, ExprNode, LoadNode, LoadSpace, RangeNode, StmtKind, TargetNode},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -450,11 +455,13 @@ pub struct PcodePlan {
     /// Local widths resolved from their uses, needed before a forward-only
     /// emitter can allocate a local's temporary.
     local_sizes: HashMap<LocalVarId, usize>,
+    /// Indexed by [`LabelId::index`]. An instruction has a handful of labels
+    /// at most, so a scan finds one faster than a map would, and without the
+    /// map's allocation.
     labels: Vec<Box<str>>,
     /// Whether each label stands at the end of the instruction, where it is
     /// the machine instruction's fall-through rather than a local block.
     terminal: Vec<bool>,
-    label_ids: HashMap<Box<str>, LabelId>,
     direct_branches: Vec<u64>,
     direct_calls: Vec<u64>,
 }
@@ -490,13 +497,12 @@ impl PcodePlan {
     /// consumer holding already-flattened p-code can rebuild an equivalent
     /// plan for the same emitter.
     pub fn declare_label(&mut self, label: &str) -> LabelId {
-        if let Some(id) = self.label_ids.get(label) {
-            return *id;
+        if let Some(id) = self.label_id(label) {
+            return id;
         }
         let id = LabelId(self.labels.len() as u32);
         self.labels.push(Box::from(label));
         self.terminal.push(false);
-        self.label_ids.insert(Box::from(label), id);
         id
     }
 
@@ -515,7 +521,10 @@ impl PcodePlan {
     }
 
     fn label_id(&self, label: &str) -> Option<LabelId> {
-        self.label_ids.get(label).copied()
+        self.labels
+            .iter()
+            .position(|name| **name == *label)
+            .map(|index| LabelId(index as u32))
     }
 }
 
@@ -596,12 +605,8 @@ pub fn plan_instruction(
     ast: &PcodeAst,
     context: &impl PcodeLoweringContext,
 ) -> Result<PcodePlan, PcodeLowerError> {
-    let mut planner = Planner {
-        context,
-        plan: PcodePlan::default(),
-    };
-    planner.plan(ast);
-    Ok(planner.plan)
+    let local_sizes = SizeInference::run(context, &ast.statements);
+    plan_instruction_with(ast, context, local_sizes)
 }
 
 /// A width in the domain a width-inference pass works over.
@@ -804,18 +809,16 @@ pub fn infer_local_sizes<S, W: Width>(
 /// the per-instruction inference cannot resolve one.
 pub fn plan_instruction_with(
     ast: &PcodeAst,
-    context: &impl PcodeLoweringContext,
+    // Widths are the only planning fact that needs the context, and they are
+    // supplied; kept so the signature mirrors `plan_instruction`.
+    _context: &impl PcodeLoweringContext,
     local_sizes: LocalSizes,
 ) -> Result<PcodePlan, PcodeLowerError> {
-    let mut planner = Planner {
-        context,
-        plan: PcodePlan {
-            local_sizes,
-            ..PcodePlan::default()
-        },
-    };
-    planner.plan_statements(ast);
-    Ok(planner.plan)
+    let mut planner = Planner::new();
+    for statement in &ast.statements {
+        planner.statement(StmtKind::from(&statement.ty));
+    }
+    Ok(planner.finish(local_sizes))
 }
 
 /// Lowers `ast` and reports each resolved operation to `sink`.
@@ -829,7 +832,11 @@ pub fn emit_instruction(
     plan: &PcodePlan,
     sink: &mut impl PcodeSink,
 ) -> Result<(), PcodeLowerError> {
-    Lowerer::new(context, plan, sink).emit_all(ast)
+    let mut emitter = Emitter::new(context, plan, sink);
+    for statement in &ast.statements {
+        emitter.statement(StmtKind::from(&statement.ty))?;
+    }
+    Ok(())
 }
 
 /// Lowers a fully expanded source-shaped AST to Ghidra-style instruction p-code.
@@ -886,7 +893,16 @@ impl InstructionPcode {
     }
 }
 
-struct Lowerer<'a, 'p, 's, C: PcodeLoweringContext + ?Sized, S: PcodeSink + ?Sized> {
+/// The emission pass: lowers statements one at a time into a [`PcodeSink`].
+///
+/// This is [`emit_instruction`] with the statement loop handed to the
+/// producer. A producer that resolves its source template on the fly feeds
+/// each statement as a [`StmtKind`] over its own [`ExprNode`], so no
+/// instruction-wide AST exists between it and the sink.
+///
+/// `plan` must come from a [`Planner`] fed the same statements, in the same
+/// order, over the same context.
+pub struct Emitter<'a, 'p, 's, C: PcodeLoweringContext + ?Sized, S: PcodeSink + ?Sized> {
     context: &'a C,
     plan: &'p PcodePlan,
     sink: &'s mut S,
@@ -896,89 +912,98 @@ struct Lowerer<'a, 'p, 's, C: PcodeLoweringContext + ?Sized, S: PcodeSink + ?Siz
 }
 
 impl<'a, 'p, 's, C: PcodeLoweringContext + ?Sized, S: PcodeSink + ?Sized>
-    Lowerer<'a, 'p, 's, C, S>
+    Emitter<'a, 'p, 's, C, S>
 {
-    fn new(context: &'a C, plan: &'p PcodePlan, sink: &'s mut S) -> Self {
+    /// Starts emitting one instruction into `sink`.
+    pub fn new(context: &'a C, plan: &'p PcodePlan, sink: &'s mut S) -> Self {
         Self {
             context,
             plan,
             sink,
-            locals: HashMap::new(),
-            defined_labels: HashSet::new(),
+            // The plan has already found every local width and label, so size
+            // the per-instruction maps once instead of growing them while
+            // emitting operations.
+            locals: HashMap::with_capacity(plan.local_sizes.len()),
+            defined_labels: HashSet::with_capacity(plan.labels.len()),
             next_unique: 0,
         }
     }
 
-    fn emit_all(mut self, ast: &PcodeAst) -> Result<(), PcodeLowerError> {
-        for statement in &ast.statements {
-            self.lower_statement(&statement.ty)?;
-        }
-        Ok(())
+    /// Lowers the next statement, reporting its operations to the sink.
+    ///
+    /// An error leaves the sink with a partially emitted instruction, which
+    /// the caller discards.
+    pub fn statement<E: ExprNode>(
+        &mut self,
+        statement: StmtKind<'_, E>,
+    ) -> Result<(), PcodeLowerError> {
+        self.lower_statement(statement)
     }
 
     fn emit(&mut self, opcode: Opcode, output: Option<Varnode>, inputs: &[Varnode]) {
         self.sink.op(opcode, output, inputs);
     }
 
-    fn lower_statement(&mut self, statement: &AstNode) -> Result<(), PcodeLowerError> {
+    fn lower_statement<E: ExprNode>(
+        &mut self,
+        statement: StmtKind<'_, E>,
+    ) -> Result<(), PcodeLowerError> {
         match statement {
-            AstNode::Assignment {
+            StmtKind::Assignment {
                 lhs: Ident::BitRange(id),
                 rhs,
                 ..
             } => {
                 let info = self
                     .context
-                    .bitrange_info(*id)
+                    .bitrange_info(id)
                     .ok_or(PcodeLowerError::Unsupported("an unknown named bit range"))?;
                 self.insert_range(info.storage, info.start, info.size, rhs)?;
             }
-            AstNode::Assignment { lhs, size, rhs } => {
-                let output =
-                    self.storage_for_ident(lhs.clone(), size.or_else(|| self.expr_size(rhs)))?;
+            StmtKind::Assignment { lhs, size, rhs } => {
+                let output = self.storage_for_ident(lhs, size.or_else(|| self.expr_size(rhs)))?;
                 self.lower_expr(rhs, Some(output))?;
             }
-            AstNode::LoadAssignment { lhs, rhs, .. } => self.lower_store(lhs, rhs)?,
-            AstNode::RangeAssignment { lhs, rhs, .. } => self.lower_range_assignment(lhs, rhs)?,
-            AstNode::Build(_) => return Err(PcodeLowerError::InternalNode("build statement")),
-            AstNode::DelaySlot(_) => {
-                return Err(PcodeLowerError::InternalNode("delay-slot directive"));
+            StmtKind::LoadAssignment { load, rhs, .. } => self.lower_store(load, rhs)?,
+            StmtKind::RangeAssignment { range, rhs, .. } => {
+                self.lower_range_assignment(range, rhs)?
             }
-            AstNode::DeferredBuild(_) => {
-                return Err(PcodeLowerError::InternalNode("deferred build statement"));
-            }
-            AstNode::Label(label) => {
-                let id = self.label_id(label)?;
+            StmtKind::Internal(node) => return Err(PcodeLowerError::InternalNode(node)),
+            StmtKind::Label(label) => {
+                let id = self.label_id(&label)?;
                 if !self.defined_labels.insert(id) {
-                    return Err(PcodeLowerError::DuplicateLabel(label.clone()));
+                    return Err(PcodeLowerError::DuplicateLabel(Box::from(&*label)));
                 }
                 self.sink.label(id);
             }
-            AstNode::Branch { target } => self.lower_direct_flow(Opcode::Branch, target, None)?,
-            AstNode::ConditionalBranch { condition, target } => {
+            StmtKind::Branch { target } => self.lower_direct_flow(Opcode::Branch, target, None)?,
+            StmtKind::ConditionalBranch { condition, target } => {
                 let condition = self.lower_expr(condition, None)?;
                 self.lower_direct_flow(Opcode::CBranch, target, Some(condition))?;
             }
-            AstNode::BranchIndirect { target } => {
+            StmtKind::BranchIndirect { target } => {
                 self.lower_indirect_flow(Opcode::BranchInd, target)?
             }
-            AstNode::Call { target } => self.lower_direct_flow(Opcode::Call, target, None)?,
-            AstNode::CallIndirect { target } => {
+            StmtKind::Call { target } => self.lower_direct_flow(Opcode::Call, target, None)?,
+            StmtKind::CallIndirect { target } => {
                 self.lower_indirect_flow(Opcode::CallInd, target)?
             }
-            AstNode::Return { target } => self.lower_indirect_flow(Opcode::Return, target)?,
-            AstNode::Export(_) => return Err(PcodeLowerError::InternalNode("export statement")),
-            AstNode::Expression(expr) => self.lower_effect(expr)?,
+            StmtKind::Return { target } => self.lower_indirect_flow(Opcode::Return, target)?,
+            StmtKind::Expression(expr) => self.lower_effect(expr)?,
         }
         Ok(())
     }
 
-    fn lower_store(&mut self, load: &Load, rhs: &Expression) -> Result<(), PcodeLowerError> {
-        let space = self.load_space(load)?;
+    fn lower_store<E: ExprNode>(
+        &mut self,
+        load: LoadNode<'_, E>,
+        rhs: E,
+    ) -> Result<(), PcodeLowerError> {
+        let space = self.load_space(&load)?;
         if space == SPACE_CONST {
             return Err(PcodeLowerError::Unsupported("a store to constant space"));
         }
-        let ptr = self.lower_expr(&load.ptr, None)?;
+        let ptr = self.lower_expr(load.ptr, None)?;
         self.validate_pointer(space, ptr)?;
         let value = match load.size {
             Some(size) => self.lower_expr_with_size(rhs, size)?,
@@ -997,25 +1022,25 @@ impl<'a, 'p, 's, C: PcodeLoweringContext + ?Sized, S: PcodeSink + ?Sized>
         Ok(())
     }
 
-    fn lower_direct_flow(
+    fn lower_direct_flow<E: ExprNode>(
         &mut self,
         opcode: Opcode,
-        target: &LabelOrNode,
+        target: TargetNode<'_, E>,
         condition: Option<Varnode>,
     ) -> Result<(), PcodeLowerError> {
         let target = match target {
-            LabelOrNode::Label(label) => {
+            TargetNode::Label(label) => {
                 // A local branch keeps its symbolic target: a streaming sink
                 // cannot be handed a relative offset to a label it has not
                 // reached yet.
-                let id = self.label_id(label)?;
+                let id = self.label_id(&label)?;
                 self.sink.branch_label(opcode, id, condition);
                 return Ok(());
             }
-            LabelOrNode::Node(_) => {
+            TargetNode::Node(_) => {
                 return Err(PcodeLowerError::InternalNode("unresolved branch target"));
             }
-            LabelOrNode::Expr(expr) => self.direct_target(expr)?,
+            TargetNode::Expr(expr) => self.direct_target(expr)?,
         };
         match condition {
             Some(condition) => self.emit(opcode, None, &[target, condition]),
@@ -1024,80 +1049,75 @@ impl<'a, 'p, 's, C: PcodeLoweringContext + ?Sized, S: PcodeSink + ?Sized>
         Ok(())
     }
 
-    fn lower_indirect_flow(
+    fn lower_indirect_flow<E: ExprNode>(
         &mut self,
         opcode: Opcode,
-        target: &Expression,
+        target: E,
     ) -> Result<(), PcodeLowerError> {
         let target = self.lower_expr(target, None)?;
         self.emit(opcode, None, &[target]);
         Ok(())
     }
 
-    fn direct_target(&self, target: &Expression) -> Result<Varnode, PcodeLowerError> {
-        let ExpressionTy::SizedInt { value, size } = target.ty else {
+    fn direct_target<E: ExprNode>(&self, target: E) -> Result<Varnode, PcodeLowerError> {
+        let ExprKind::SizedInt { value, size } = target.kind() else {
             return Err(PcodeLowerError::InvalidDirectTarget);
         };
         let size = size
-            .or(target.size)
+            .or(target.size())
             .or_else(|| self.context.address_size(self.context.default_space()))
             .ok_or(PcodeLowerError::UnknownSize)?;
         Self::checked_size(size)?;
         Ok(Varnode::new(self.context.default_space(), value, size))
     }
 
-    fn lower_effect(&mut self, expr: &Expression) -> Result<(), PcodeLowerError> {
-        match &expr.ty {
-            ExpressionTy::PcodeOp { id, args } => {
-                let inputs = self.lower_userop_inputs(*id, args)?;
+    fn lower_effect<E: ExprNode>(&mut self, expr: E) -> Result<(), PcodeLowerError> {
+        match expr.kind() {
+            ExprKind::PcodeOp { id, args } => {
+                let inputs = self.lower_userop_inputs::<E>(id, args)?;
                 self.emit(Opcode::CallOther, None, &inputs);
                 Ok(())
             }
-            ExpressionTy::MacroCall { .. } => Err(PcodeLowerError::InternalNode("macro call")),
-            ExpressionTy::DeferredCall { .. } => {
-                Err(PcodeLowerError::InternalNode("deferred call"))
-            }
+            ExprKind::Internal(node) => Err(PcodeLowerError::InternalNode(node)),
             _ => Err(PcodeLowerError::Unsupported("a discarded value expression")),
         }
     }
 
-    fn lower_expr(
+    fn lower_expr<E: ExprNode>(
         &mut self,
-        expr: &Expression,
+        expr: E,
         requested_output: Option<Varnode>,
     ) -> Result<Varnode, PcodeLowerError> {
-        match &expr.ty {
-            ExpressionTy::SizedInt { value, size } => {
+        match expr.kind() {
+            ExprKind::SizedInt { value, size } => {
                 // Raw p-code integer literals take the width of the
                 // operation that consumes them, including an explicitly
                 // suffixed source literal used for a wider x86-64 register
                 // write (for example `R10 = imm32`).
                 let input = Varnode::constant(
-                    *value,
+                    value,
                     requested_output
                         .map(|output| output.size)
-                        .or(*size)
-                        .or(expr.size)
+                        .or(size)
+                        .or(expr.size())
                         .ok_or(PcodeLowerError::UnknownSize)?,
                 );
                 self.copy_if_requested(input, requested_output)
             }
-            ExpressionTy::Ident(Ident::BitRange(id)) => {
-                self.lower_named_bitrange(*id, requested_output)
-            }
-            ExpressionTy::Ident(ident) => {
-                let input = self.storage_for_ident(ident.clone(), expr.size)?;
+            ExprKind::Ident(Ident::BitRange(id)) => self.lower_named_bitrange(id, requested_output),
+            ExprKind::Ident(ident) => {
+                let input = self.storage_for_ident(ident, expr.size())?;
                 self.copy_if_requested(input, requested_output)
             }
-            ExpressionTy::Load(load) => self.lower_load(expr, load, requested_output),
-            ExpressionTy::SubPieceMsb { src, count } => {
+            ExprKind::Load(load) => self.lower_load(expr, load, requested_output),
+            ExprKind::SubPieceMsb { src, count } => {
                 let input = self.lower_expr(src, None)?;
                 let size = requested_output
                     .map(|output| output.size)
-                    .or(expr.size)
-                    .unwrap_or_else(|| input.size.saturating_sub(*count));
+                    .or(expr.size())
+                    .unwrap_or_else(|| input.size.saturating_sub(count));
                 let output = self.output(requested_output, size)?;
-                if *count >= input.size || size > input.size - count {
+                if count >= input.size || size > input.size - count {
                     return Err(PcodeLowerError::InvalidRange {
                         start: count.saturating_mul(8),
                         size: size.saturating_mul(8),
@@ -1107,20 +1127,20 @@ impl<'a, 'p, 's, C: PcodeLoweringContext + ?Sized, S: PcodeSink + ?Sized>
                 self.emit(
                     Opcode::SubPiece,
                     Some(output),
-                    &[input, Varnode::constant(*count as u64, 8)],
+                    &[input, Varnode::constant(count as u64, 8)],
                 );
                 Ok(output)
             }
-            ExpressionTy::SubPieceLsb { src, count } => {
+            ExprKind::SubPieceLsb { src, count } => {
                 let input = self.lower_expr(src, None)?;
-                if *count == 0 || *count > input.size {
+                if count == 0 || count > input.size {
                     return Err(PcodeLowerError::InvalidRange {
                         start: 0,
                         size: count.saturating_mul(8),
                         storage_bits: input.size.saturating_mul(8),
                     });
                 }
-                let output = self.output(requested_output, *count)?;
+                let output = self.output(requested_output, count)?;
                 self.emit(
                     Opcode::SubPiece,
                     Some(output),
@@ -1128,46 +1148,43 @@ impl<'a, 'p, 's, C: PcodeLoweringContext + ?Sized, S: PcodeSink + ?Sized>
                 );
                 Ok(output)
             }
-            ExpressionTy::Range(range) => self.lower_range(range, requested_output),
-            ExpressionTy::FunctionCall { builtin, args } => {
-                self.lower_builtin(expr, *builtin, args, requested_output)
+            ExprKind::Range(range) => self.lower_range(range, requested_output),
+            ExprKind::FunctionCall { builtin, args } => {
+                self.lower_builtin(expr, builtin, args, requested_output)
             }
-            ExpressionTy::PcodeOp { id, args } => {
+            ExprKind::PcodeOp { id, args } => {
                 let size = requested_output
                     .map(|output| output.size)
-                    .or(expr.size)
+                    .or(expr.size())
                     .ok_or(PcodeLowerError::UnknownSize)?;
                 let output = self.output(requested_output, size)?;
-                let inputs = self.lower_userop_inputs(*id, args)?;
+                let inputs = self.lower_userop_inputs::<E>(id, args)?;
                 self.emit(Opcode::CallOther, Some(output), &inputs);
                 Ok(output)
             }
-            ExpressionTy::MacroCall { .. } => Err(PcodeLowerError::InternalNode("macro call")),
-            ExpressionTy::DeferredCall { .. } => {
-                Err(PcodeLowerError::InternalNode("deferred call"))
-            }
-            ExpressionTy::Unop(unop) => self.lower_unop(expr, unop.op, &unop.e, requested_output),
-            ExpressionTy::Binop(binop) => {
-                self.lower_binop(expr, binop.op, &binop.lhs, &binop.rhs, requested_output)
+            ExprKind::Internal(node) => Err(PcodeLowerError::InternalNode(node)),
+            ExprKind::Unop { op, e } => self.lower_unop(expr, op, e, requested_output),
+            ExprKind::Binop { op, lhs, rhs } => {
+                self.lower_binop(expr, op, lhs, rhs, requested_output)
             }
         }
     }
 
-    fn lower_load(
+    fn lower_load<E: ExprNode>(
         &mut self,
-        expr: &Expression,
-        load: &Load,
+        expr: E,
+        load: LoadNode<'_, E>,
         requested_output: Option<Varnode>,
     ) -> Result<Varnode, PcodeLowerError> {
-        let space = self.load_space(load)?;
-        let ptr = self.lower_expr(&load.ptr, None)?;
+        let space = self.load_space(&load)?;
+        let ptr = self.lower_expr(load.ptr, None)?;
         if space != SPACE_CONST {
             self.validate_pointer(space, ptr)?;
         }
         let size = requested_output
             .map(|output| output.size)
             .or(load.size)
-            .or(expr.size)
+            .or(expr.size())
             .ok_or(PcodeLowerError::UnknownSize)?;
         if space == SPACE_CONST {
             if ptr.size != size {
@@ -1182,11 +1199,11 @@ impl<'a, 'p, 's, C: PcodeLoweringContext + ?Sized, S: PcodeSink + ?Sized>
         Ok(output)
     }
 
-    fn lower_builtin(
+    fn lower_builtin<E: ExprNode>(
         &mut self,
-        expr: &Expression,
+        expr: E,
         builtin: Builtin,
-        args: &[Expression],
+        args: E::Args,
         requested_output: Option<Varnode>,
     ) -> Result<Varnode, PcodeLowerError> {
         let opcode = match builtin {
@@ -1211,13 +1228,13 @@ impl<'a, 'p, 's, C: PcodeLoweringContext + ?Sized, S: PcodeSink + ?Sized>
         };
         let size = requested_output
             .map(|output| output.size)
-            .or(expr.size)
+            .or(expr.size())
             .or_else(|| match builtin {
                 Builtin::Carry | Builtin::Scarry | Builtin::Sborrow | Builtin::Nan => Some(1),
                 // The width-preserving float builtins answer in their operand's
                 // width, so `trunc(round(XmmReg2[0,32]))` needs no local.
                 Builtin::Abs | Builtin::Sqrt | Builtin::Floor | Builtin::Ceil | Builtin::Round => {
-                    args.first().and_then(|arg| self.expr_size(arg))
+                    args.clone().next().and_then(|arg| self.expr_size(arg))
                 }
                 _ => None,
             })
@@ -1227,48 +1244,48 @@ impl<'a, 'p, 's, C: PcodeLoweringContext + ?Sized, S: PcodeSink + ?Sized>
         // integer operands. Their result width therefore cannot provide the
         // context required by a nested `zext`; carry the first operand's width
         // into the remaining operands instead.
-        let inputs = if matches!(builtin, Builtin::Carry | Builtin::Scarry | Builtin::Sborrow)
-            && !args.is_empty()
+        let mut inputs = Inputs::default();
+        if matches!(builtin, Builtin::Carry | Builtin::Scarry | Builtin::Sborrow) && args.len() != 0
         {
             // The first operand can be an unsized literal (`sborrow(0, RAX)`
             // in x86 `NEG`). Carry-family operands must all have the same
             // width, so derive it from any concrete operand before lowering.
             let operand_size = args
-                .iter()
+                .clone()
                 .find_map(|arg| self.expr_size(arg))
                 .ok_or(PcodeLowerError::UnknownSize)?;
-            args.iter()
-                .map(|arg| self.lower_expr_with_size(arg, operand_size))
-                .collect::<Result<Vec<_>, _>>()?
+            for arg in args {
+                inputs.push(self.lower_expr_with_size(arg, operand_size)?);
+            }
         } else {
-            args.iter()
-                .map(|arg| self.lower_expr(arg, None))
-                .collect::<Result<Vec<_>, _>>()?
-        };
+            for arg in args {
+                inputs.push(self.lower_expr(arg, None)?);
+            }
+        }
         self.emit(opcode, Some(output), &inputs);
         Ok(output)
     }
 
-    fn lower_unop(
+    fn lower_unop<E: ExprNode>(
         &mut self,
-        expr: &Expression,
+        expr: E,
         op: UnaryOperator,
-        operand: &Expression,
+        operand: E,
         requested_output: Option<Varnode>,
     ) -> Result<Varnode, PcodeLowerError> {
         if let UnaryOperator::AddressOf(size) = op {
             // An address symbol such as `inst_next` already *is* its address;
             // taking its address only fixes the width.
-            if let ExpressionTy::SizedInt {
+            if let ExprKind::SizedInt {
                 value,
                 size: literal_size,
-            } = &operand.ty
+            } = operand.kind()
             {
                 let size = size
-                    .or(*literal_size)
-                    .or(operand.size)
+                    .or(literal_size)
+                    .or(operand.size())
                     .ok_or(PcodeLowerError::UnknownSize)?;
-                return self.copy_if_requested(Varnode::constant(*value, size), requested_output);
+                return self.copy_if_requested(Varnode::constant(value, size), requested_output);
             }
             let storage = self.storage_from_expr(operand)?;
             let size = size
@@ -1290,7 +1307,7 @@ impl<'a, 'p, 's, C: PcodeLoweringContext + ?Sized, S: PcodeSink + ?Sized>
         // lowering the literal without a consumer.
         let size = requested_output
             .map(|output| output.size)
-            .or(expr.size)
+            .or(expr.size())
             .or_else(|| (op == UnaryOperator::LogicalNot).then_some(1))
             .or_else(|| self.expr_size(operand))
             .ok_or(PcodeLowerError::UnknownSize)?;
@@ -1307,12 +1324,12 @@ impl<'a, 'p, 's, C: PcodeLoweringContext + ?Sized, S: PcodeSink + ?Sized>
         Ok(output)
     }
 
-    fn lower_binop(
+    fn lower_binop<E: ExprNode>(
         &mut self,
-        expr: &Expression,
+        expr: E,
         op: BinaryOperator,
-        lhs: &Expression,
-        rhs: &Expression,
+        lhs: E,
+        rhs: E,
         requested_output: Option<Varnode>,
     ) -> Result<Varnode, PcodeLowerError> {
         let (opcode, reverse) = binary_opcode(op);
@@ -1331,34 +1348,28 @@ impl<'a, 'p, 's, C: PcodeLoweringContext + ?Sized, S: PcodeSink + ?Sized>
         } else {
             requested_output
                 .map(|output| output.size)
-                .or(expr.size)
+                .or(expr.size())
                 .or_else(|| self.expr_size(lhs))
                 .or_else(|| self.expr_size(rhs))
         };
         let mut inputs = match input_size {
-            Some(size) => vec![
+            Some(size) => [
                 self.lower_expr_with_size(lhs, size)?,
                 self.lower_expr_with_size(rhs, size)?,
             ],
-            None => vec![self.lower_expr(lhs, None)?, self.lower_expr(rhs, None)?],
+            None => [self.lower_expr(lhs, None)?, self.lower_expr(rhs, None)?],
         };
         if reverse {
             inputs.swap(0, 1);
         }
         let size = requested_output
             .map(|output| output.size)
-            .or(expr.size)
+            .or(expr.size())
             .or_else(|| op.is_comparison().then_some(1))
             .or(input_size)
             .ok_or(PcodeLowerError::UnknownSize)?;
         let output = self.output(requested_output, size)?;
-        if (op.is_comparison()
-            || matches!(
-                op,
-                BinaryOperator::LogicalXor | BinaryOperator::LogicalAnd | BinaryOperator::LogicalOr
-            ))
-            && output.size != 1
-        {
+        if is_boolean && output.size != 1 {
             return Err(PcodeLowerError::InvalidBooleanSize(output.size));
         }
         if inputs[0].size != inputs[1].size {
@@ -1368,13 +1379,7 @@ impl<'a, 'p, 's, C: PcodeLoweringContext + ?Sized, S: PcodeSink + ?Sized>
                 right: inputs[1].size,
             });
         }
-        if !op.is_comparison()
-            && !matches!(
-                op,
-                BinaryOperator::LogicalXor | BinaryOperator::LogicalAnd | BinaryOperator::LogicalOr
-            )
-            && output.size != inputs[0].size
-        {
+        if !is_boolean && output.size != inputs[0].size {
             return Err(PcodeLowerError::CopySizeMismatch {
                 input: inputs[0].size,
                 output: output.size,
@@ -1392,17 +1397,17 @@ impl<'a, 'p, 's, C: PcodeLoweringContext + ?Sized, S: PcodeSink + ?Sized>
     /// propagates that context into compound expressions, while
     /// [`copy_if_requested`](Self::copy_if_requested) inserts an explicit
     /// zero-extension or low-byte `SUBPIECE` for a directly stored value.
-    fn lower_expr_with_size(
+    fn lower_expr_with_size<E: ExprNode>(
         &mut self,
-        expr: &Expression,
+        expr: E,
         size: usize,
     ) -> Result<Varnode, PcodeLowerError> {
         // SLEIGH integer literals are polymorphic in raw p-code: the
         // surrounding operation determines their varnode width (for example
         // `RAX + 1`). This applies even when parsing retained a literal's
         // minimal source width.
-        if let ExpressionTy::SizedInt { value, .. } = &expr.ty {
-            return Ok(Varnode::constant(*value, size));
+        if let ExprKind::SizedInt { value, .. } = expr.kind() {
+            return Ok(Varnode::constant(value, size));
         }
         if self.expr_size(expr) == Some(size) {
             return self.lower_expr(expr, None);
@@ -1411,13 +1416,13 @@ impl<'a, 'p, 's, C: PcodeLoweringContext + ?Sized, S: PcodeSink + ?Sized>
         self.lower_expr(expr, Some(output))
     }
 
-    fn lower_range(
+    fn lower_range<E: ExprNode>(
         &mut self,
-        range: &Range,
+        range: RangeNode<E>,
         requested_output: Option<Varnode>,
     ) -> Result<Varnode, PcodeLowerError> {
-        let input = self.lower_expr(&range.value, None)?;
-        let (start, bits) = range_params(range)?;
+        let input = self.lower_expr(range.value, None)?;
+        let (start, bits) = range_params(&range)?;
         self.extract_range(input, start, bits, requested_output)
     }
 
@@ -1470,30 +1475,30 @@ impl<'a, 'p, 's, C: PcodeLoweringContext + ?Sized, S: PcodeSink + ?Sized>
         Ok(output)
     }
 
-    fn lower_range_assignment(
+    fn lower_range_assignment<E: ExprNode>(
         &mut self,
-        range: &Range,
-        rhs: &Expression,
+        range: RangeNode<E>,
+        rhs: E,
     ) -> Result<(), PcodeLowerError> {
-        if let ExpressionTy::Load(load) = &range.value.ty {
+        if let ExprKind::Load(load) = range.value.kind() {
             return self.lower_load_range_assignment(load, range, rhs);
         }
-        let storage = self.storage_from_expr(&range.value)?;
-        let (start, bits) = range_params(range)?;
+        let storage = self.storage_from_expr(range.value)?;
+        let (start, bits) = range_params(&range)?;
         self.insert_range(storage, start, bits, rhs)
     }
 
     /// Lowers a bit-range write into a memory load as load/modify/store. SLEIGH
     /// uses this form for packed MMX lanes backed by private RAM, where an
     /// address-of expression cannot name a raw-p-code varnode directly.
-    fn lower_load_range_assignment(
+    fn lower_load_range_assignment<E: ExprNode>(
         &mut self,
-        load: &Load,
-        range: &Range,
-        rhs: &Expression,
+        load: LoadNode<'_, E>,
+        range: RangeNode<E>,
+        rhs: E,
     ) -> Result<(), PcodeLowerError> {
-        let storage = self.lower_load(&range.value, load, None)?;
-        let (start, bits) = range_params(range)?;
+        let storage = self.lower_load(range.value, load, None)?;
+        let (start, bits) = range_params(&range)?;
         Self::validate_range(storage, start, bits)?;
         if storage.size > 8 {
             // A byte-aligned lane of a wide memory operand is stored on its
@@ -1512,11 +1517,11 @@ impl<'a, 'p, 's, C: PcodeLoweringContext + ?Sized, S: PcodeSink + ?Sized>
                     output: lane.size,
                 });
             }
-            let space = self.load_space(load)?;
+            let space = self.load_space(&load)?;
             if space == SPACE_CONST {
                 return Err(PcodeLowerError::Unsupported("a store to constant space"));
             }
-            let ptr = self.lower_expr(&load.ptr, None)?;
+            let ptr = self.lower_expr(load.ptr, None)?;
             self.validate_pointer(space, ptr)?;
             let lane_ptr = if start == 0 {
                 ptr
@@ -1573,22 +1578,22 @@ impl<'a, 'p, 's, C: PcodeLoweringContext + ?Sized, S: PcodeSink + ?Sized>
         let result = self.allocate_unique(storage.size)?;
         self.emit(Opcode::IntOr, Some(result), &[kept, shifted]);
 
-        let space = self.load_space(load)?;
+        let space = self.load_space(&load)?;
         if space == SPACE_CONST {
             return Err(PcodeLowerError::Unsupported("a store to constant space"));
         }
-        let ptr = self.lower_expr(&load.ptr, None)?;
+        let ptr = self.lower_expr(load.ptr, None)?;
         self.validate_pointer(space, ptr)?;
         self.emit(Opcode::Store, None, &[Self::space_id(space), ptr, result]);
         Ok(())
     }
 
-    fn insert_range(
+    fn insert_range<E: ExprNode>(
         &mut self,
         storage: Varnode,
         start: usize,
         bits: usize,
-        rhs: &Expression,
+        rhs: E,
     ) -> Result<(), PcodeLowerError> {
         Self::validate_range(storage, start, bits)?;
         // Inserting needs a full-width clear mask. Constants in this AST are
@@ -1717,9 +1722,9 @@ impl<'a, 'p, 's, C: PcodeLoweringContext + ?Sized, S: PcodeSink + ?Sized>
         Ok(())
     }
 
-    fn storage_from_expr(&mut self, expr: &Expression) -> Result<Varnode, PcodeLowerError> {
-        match &expr.ty {
-            ExpressionTy::Ident(ident) => self.storage_for_ident(ident.clone(), expr.size),
+    fn storage_from_expr<E: ExprNode>(&mut self, expr: E) -> Result<Varnode, PcodeLowerError> {
+        match expr.kind() {
+            ExprKind::Ident(ident) => self.storage_for_ident(ident, expr.size()),
             _ => Err(PcodeLowerError::Unsupported(
                 "address-of a non-varnode expression",
             )),
@@ -1760,18 +1765,16 @@ impl<'a, 'p, 's, C: PcodeLoweringContext + ?Sized, S: PcodeSink + ?Sized>
         }
     }
 
-    fn lower_userop_inputs(
+    fn lower_userop_inputs<E: ExprNode>(
         &mut self,
         id: PCodeOpId,
-        args: &[Expression],
-    ) -> Result<Vec<Varnode>, PcodeLowerError> {
-        let mut inputs = Vec::with_capacity(args.len() + 1);
+        args: E::Args,
+    ) -> Result<Inputs, PcodeLowerError> {
+        let mut inputs = Inputs::default();
         inputs.push(Varnode::constant(usize::from(id) as u64, 4));
-        inputs.extend(
-            args.iter()
-                .map(|arg| self.lower_expr(arg, None))
-                .collect::<Result<Vec<_>, _>>()?,
-        );
+        for arg in args {
+            inputs.push(self.lower_expr(arg, None)?);
+        }
         Ok(inputs)
     }
 
@@ -1845,65 +1848,138 @@ impl<'a, 'p, 's, C: PcodeLoweringContext + ?Sized, S: PcodeSink + ?Sized>
     }
 }
 
-/// The read-only pass which produces a [`PcodePlan`].
+/// The inputs of one operation as they are lowered.
 ///
-/// It is generic over the statement span so a producer can run the same width
-/// inference over its own *source* bodies, before any instruction is decoded,
-/// rather than keeping a second implementation that can drift from this one.
-struct Planner<'a, C: PcodeLoweringContext + ?Sized> {
-    context: &'a C,
+/// Almost every operation has at most a few, so they are kept on the stack;
+/// a user operation with more spills to the heap. This keeps the emitter
+/// from allocating once per call it lowers.
+struct Inputs {
+    inline: [Varnode; Inputs::INLINE],
+    len: usize,
+    spilled: Vec<Varnode>,
+}
+
+impl Default for Inputs {
+    fn default() -> Self {
+        Self {
+            inline: [Varnode::constant(0, 1); Self::INLINE],
+            len: 0,
+            spilled: Vec::new(),
+        }
+    }
+}
+
+impl Inputs {
+    const INLINE: usize = 6;
+
+    fn push(&mut self, input: Varnode) {
+        if self.len < Self::INLINE {
+            self.inline[self.len] = input;
+        } else {
+            if self.len == Self::INLINE {
+                self.spilled.extend_from_slice(&self.inline);
+            }
+            self.spilled.push(input);
+        }
+        self.len += 1;
+    }
+}
+
+impl std::ops::Deref for Inputs {
+    type Target = [Varnode];
+
+    fn deref(&self) -> &[Varnode] {
+        if self.len <= Self::INLINE {
+            &self.inline[..self.len]
+        } else {
+            &self.spilled
+        }
+    }
+}
+
+/// The planning pass: collects a [`PcodePlan`] from statements fed one at a
+/// time.
+///
+/// This is [`plan_instruction`] with the statement loop handed to the
+/// producer, so the plan can be built from the same on-the-fly resolution the
+/// [`Emitter`] then lowers. Local widths are either supplied up front, when
+/// the producer resolved them from its source bodies, or inferred first with a
+/// [`SizeInference`] over the same statements.
+#[derive(Default)]
+pub struct Planner {
     plan: PcodePlan,
 }
 
-impl<'a, C: PcodeLoweringContext + ?Sized> Planner<'a, C> {
-    fn plan(&mut self, ast: &PcodeAst) {
-        self.plan.local_sizes = SizeInference::run(self.context, &ast.statements);
-        self.plan_statements(ast);
+impl Planner {
+    /// Starts an empty plan.
+    pub fn new() -> Self {
+        Self {
+            plan: PcodePlan::default(),
+        }
     }
 
-    /// Collects the facts that do not depend on local widths: the labels and
-    /// the addresses this instruction reaches directly.
-    fn plan_statements(&mut self, ast: &PcodeAst) {
-        for statement in &ast.statements {
-            match &statement.ty {
-                AstNode::Label(label) => {
-                    self.plan.declare_label(label);
-                }
-                AstNode::Branch { target } | AstNode::ConditionalBranch { target, .. } => {
-                    // A target this pass cannot resolve is left out; emission
-                    // reports it with the error it would have reported before.
-                    if let LabelOrNode::Expr(expr) = target
-                        && let Some(address) = self.direct_address(expr)
-                    {
-                        self.plan.declare_direct_branch(address);
-                    }
-                }
-                AstNode::Call { target } => {
-                    if let LabelOrNode::Expr(expr) = target
-                        && let Some(address) = self.direct_address(expr)
-                    {
-                        self.plan.declare_direct_call(address);
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        // Only labels may follow the last operation-producing statement, so
-        // the trailing run of labels is exactly the terminal one.
-        for statement in ast.statements.iter().rev() {
-            let AstNode::Label(label) = &statement.ty else {
-                break;
-            };
-            if let Some(id) = self.plan.label_id(label) {
+    /// Records the facts of the next statement that do not depend on local
+    /// widths: the labels, and the addresses this instruction reaches
+    /// directly.
+    pub fn statement<E: ExprNode>(&mut self, statement: StmtKind<'_, E>) {
+        match statement {
+            StmtKind::Label(label) => {
+                // Only labels may follow the last operation-producing
+                // statement, so a label is terminal exactly while no such
+                // statement comes after it.
+                let id = self.plan.declare_label(&label);
                 self.plan.terminal[id.index()] = true;
+                return;
             }
+            StmtKind::Branch { target } | StmtKind::ConditionalBranch { target, .. } => {
+                // A target this pass cannot resolve is left out; emission
+                // reports it with the error it would have reported before.
+                if let TargetNode::Expr(expr) = target
+                    && let Some(address) = Self::direct_address(expr)
+                {
+                    self.plan.declare_direct_branch(address);
+                }
+            }
+            StmtKind::Call { target } => {
+                if let TargetNode::Expr(expr) = target
+                    && let Some(address) = Self::direct_address(expr)
+                {
+                    self.plan.declare_direct_call(address);
+                }
+            }
+            _ => {}
         }
+        self.end_terminal_run();
     }
 
-    fn direct_address<S>(&self, target: &Expression<S>) -> Option<u64> {
-        match target.ty {
-            ExpressionTy::SizedInt { value, .. } => Some(value),
+    /// Records a statement whose shape the planner cannot see.
+    ///
+    /// It contributes no labels or targets, but it is not a label, so it ends
+    /// the run of terminal labels.
+    pub fn opaque_statement(&mut self) {
+        self.end_terminal_run();
+    }
+
+    /// A non-label statement happened: no label declared so far is terminal.
+    fn end_terminal_run(&mut self) {
+        self.plan.terminal.iter_mut().for_each(|flag| *flag = false);
+    }
+
+    /// The finished plan, with `local_sizes` as the widths of the
+    /// instruction's locals.
+    ///
+    /// The caller guarantees `local_sizes` covers every local the instruction
+    /// uses; a missing width is an `UnknownSize` error at emission. The widths
+    /// come last because a producer that resolves them from its source bodies
+    /// only knows them all once it has walked every statement.
+    pub fn finish(mut self, local_sizes: LocalSizes) -> PcodePlan {
+        self.plan.local_sizes = local_sizes;
+        self.plan
+    }
+
+    fn direct_address<E: ExprNode>(target: E) -> Option<u64> {
+        match target.kind() {
+            ExprKind::SizedInt { value, .. } => Some(value),
             _ => None,
         }
     }
@@ -1912,82 +1988,114 @@ impl<'a, C: PcodeLoweringContext + ?Sized> Planner<'a, C> {
 /// The width-inference pass, shared by specification-compile time and by
 /// per-instruction planning.
 ///
-/// It is generic over the statement span so a producer can run it over its own
-/// *source* bodies, and over the width domain so those bodies can be resolved
-/// before the values a decode substitutes into them are known.
-struct SizeInference<'a, C: PcodeLoweringContext + ?Sized, W: Width> {
+/// It is generic over the statement representation so a producer can run it
+/// over its own *source* bodies, and over the width domain so those bodies can
+/// be resolved before the values a decode substitutes into them are known.
+///
+/// Inference is a fixed point: a forward-only pass cannot size, for example,
+/// `v = 255 & 31` until a later `word << v` reveals that `v` is a word-wide
+/// shift count. [`run`](Self::run) iterates it over a slice; a producer that
+/// streams its statements feeds them through [`statement`](Self::statement)
+/// and repeats the whole sequence while [`progressed`](Self::progressed)
+/// says a pass found something new, at most once more than there are
+/// statements.
+pub struct SizeInference<'a, C: PcodeLoweringContext + ?Sized, W: Width> {
     context: &'a C,
     sizes: HashMap<LocalVarId, W>,
+    /// Whether a width was found since the last [`progressed`](Self::progressed).
+    progressed: bool,
 }
 
 impl<'a, C: PcodeLoweringContext + ?Sized, W: Width> SizeInference<'a, C, W> {
-    fn run<S>(context: &'a C, statements: &[Ast<S>]) -> HashMap<LocalVarId, W> {
-        let mut inference = Self {
+    /// Starts an inference with no widths known.
+    pub fn new(context: &'a C) -> Self {
+        Self {
             context,
             sizes: HashMap::new(),
-        };
-        inference.infer(statements);
-        inference.sizes
-    }
-
-    /// Resolve local widths from their uses. A forward-only allocator cannot
-    /// size, for example, `v = 255 & 31` until a later `word << v` reveals
-    /// that `v` is a word-wide shift count.
-    fn infer<S>(&mut self, statements: &[Ast<S>]) {
-        // Each pass can discover at least one previously unknown local. The
-        // extra pass propagates that discovery through a chain of locals.
-        for _ in 0..=statements.len() {
-            let before = self.sizes.len();
-            for statement in statements {
-                self.constrain_statement(&statement.ty);
-            }
-            if self.sizes.len() == before {
-                break;
-            }
+            progressed: false,
         }
     }
 
-    fn constrain_statement<S>(&mut self, statement: &AstNode<S>) {
+    /// Infers the widths of `statements` to a fixed point.
+    pub fn run<S>(context: &'a C, statements: &[Ast<S>]) -> HashMap<LocalVarId, W> {
+        let mut inference = Self::new(context);
+        // Each pass can discover at least one previously unknown local. The
+        // extra pass propagates that discovery through a chain of locals.
+        for _ in 0..=statements.len() {
+            for statement in statements {
+                inference.statement(StmtKind::from(&statement.ty));
+            }
+            if !inference.progressed() {
+                break;
+            }
+        }
+        inference.finish()
+    }
+
+    /// Constrains the locals of the next statement by their uses in it.
+    pub fn statement<E: ExprNode>(&mut self, statement: StmtKind<'_, E>) {
+        self.constrain_statement(statement);
+    }
+
+    /// Whether a width was found since this was last asked, so the caller
+    /// knows to feed the statements again.
+    pub fn progressed(&mut self) -> bool {
+        std::mem::take(&mut self.progressed)
+    }
+
+    /// The widths found so far.
+    pub fn finish(self) -> HashMap<LocalVarId, W> {
+        self.sizes
+    }
+
+    fn found(&mut self, id: LocalVarId, size: W) {
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.sizes.entry(id) {
+            entry.insert(size);
+            self.progressed = true;
+        }
+    }
+
+    fn constrain_statement<E: ExprNode>(&mut self, statement: StmtKind<'_, E>) {
         match statement {
-            AstNode::Assignment { lhs, size, rhs } => {
+            StmtKind::Assignment { lhs, size, rhs } => {
                 // Comparisons normally infer a one-byte result. A different
                 // explicit expression size must still reach lowering so it is
                 // rejected as an invalid raw boolean output.
                 let comparison_size =
-                    matches!(&rhs.ty, ExpressionTy::Binop(binop) if binop.op.is_comparison())
-                        .then_some(rhs.size)
+                    matches!(rhs.kind(), ExprKind::Binop { op, .. } if op.is_comparison())
+                        .then(|| rhs.size())
                         .flatten()
                         .filter(|&size| size != 1)
                         .map(W::fixed);
-                let expected = (*size)
+                let expected = size
                     .map(W::fixed)
-                    .or_else(|| self.storage_size(lhs))
+                    .or_else(|| self.storage_size(&lhs))
                     .or(comparison_size);
                 let inferred = self.constrain_expr(rhs, expected);
                 if let Ident::Named(id) = lhs
                     && let Some(size) = expected.or(inferred)
                 {
-                    self.sizes.entry(*id).or_insert(size);
+                    self.found(id, size);
                 }
             }
-            AstNode::LoadAssignment { lhs, rhs, .. } => {
-                let space = self.load_space(lhs).ok();
+            StmtKind::LoadAssignment { load, rhs, .. } => {
+                let space = self.load_space(&load).ok();
                 if let Some(space) = space {
-                    self.constrain_expr(&lhs.ptr, self.context.address_size(space).map(W::fixed));
+                    self.constrain_expr(load.ptr, self.context.address_size(space).map(W::fixed));
                 }
-                self.constrain_expr(rhs, lhs.size.map(W::fixed));
+                self.constrain_expr(rhs, load.size.map(W::fixed));
             }
-            AstNode::RangeAssignment { lhs, rhs, .. } => {
-                if let Ok((_, bits)) = range_params(lhs) {
+            StmtKind::RangeAssignment { range, rhs, .. } => {
+                if let Ok((_, bits)) = range_params(&range) {
                     self.constrain_expr(rhs, Some(W::fixed(bits.div_ceil(8))));
                 }
             }
-            AstNode::ConditionalBranch { condition, .. } => {
+            StmtKind::ConditionalBranch { condition, .. } => {
                 self.constrain_expr(condition, Some(W::fixed(1)));
             }
-            AstNode::BranchIndirect { target }
-            | AstNode::CallIndirect { target }
-            | AstNode::Return { target } => {
+            StmtKind::BranchIndirect { target }
+            | StmtKind::CallIndirect { target }
+            | StmtKind::Return { target } => {
                 self.constrain_expr(
                     target,
                     self.context
@@ -1995,72 +2103,69 @@ impl<'a, C: PcodeLoweringContext + ?Sized, W: Width> SizeInference<'a, C, W> {
                         .map(W::fixed),
                 );
             }
-            AstNode::Expression(expr) => {
+            StmtKind::Expression(expr) => {
                 self.constrain_expr(expr, None);
             }
-            AstNode::Build(_)
-            | AstNode::DelaySlot(_)
-            | AstNode::DeferredBuild(_)
-            | AstNode::Label(_)
-            | AstNode::Branch { .. }
-            | AstNode::Call { .. }
-            | AstNode::Export(_) => {}
+            StmtKind::Internal(_)
+            | StmtKind::Label(_)
+            | StmtKind::Branch { .. }
+            | StmtKind::Call { .. } => {}
         }
     }
 
     /// Applies an optional consumer width to `expr` and returns any concrete
     /// output width known after that constraint. Integer literals intentionally
     /// do not establish a width on their own.
-    fn constrain_expr<S>(&mut self, expr: &Expression<S>, expected: Option<W>) -> Option<W> {
-        match &expr.ty {
-            ExpressionTy::SizedInt { .. } => expected,
-            ExpressionTy::Ident(Ident::Named(id)) => {
-                if let Some(&size) = self.sizes.get(id) {
+    fn constrain_expr<E: ExprNode>(&mut self, expr: E, expected: Option<W>) -> Option<W> {
+        match expr.kind() {
+            ExprKind::SizedInt { .. } => expected,
+            ExprKind::Ident(Ident::Named(id)) => {
+                if let Some(&size) = self.sizes.get(&id) {
                     Some(size)
                 } else if let Some(size) = expected {
-                    self.sizes.insert(*id, size);
+                    self.found(id, size);
                     Some(size)
                 } else {
                     None
                 }
             }
-            ExpressionTy::Ident(ident) => self.storage_size(ident),
-            ExpressionTy::Load(load) => {
-                if let Ok(space) = self.load_space(load) {
-                    self.constrain_expr(&load.ptr, self.context.address_size(space).map(W::fixed));
+            ExprKind::Ident(ident) => self.storage_size(&ident),
+            ExprKind::Load(load) => {
+                if let Ok(space) = self.load_space(&load) {
+                    self.constrain_expr(load.ptr, self.context.address_size(space).map(W::fixed));
                 }
                 load.size.map(W::fixed).or(expected)
             }
-            ExpressionTy::SubPieceLsb { src, count } => {
+            ExprKind::SubPieceLsb { src, count } => {
                 self.constrain_expr(src, None);
-                Some(W::fixed(*count))
+                Some(W::fixed(count))
             }
-            ExpressionTy::SubPieceMsb { src, count } => {
+            ExprKind::SubPieceMsb { src, count } => {
                 // Truncation is arithmetic on a width, so a still-symbolic
                 // operand width yields no constraint rather than a wrong one.
                 let size = expected
-                    .or_else(|| Some(W::fixed(self.expr_size(src)?.size()?.checked_sub(*count)?)));
+                    .or_else(|| Some(W::fixed(self.expr_size(src)?.size()?.checked_sub(count)?)));
                 let source = size
                     .and_then(|size| size.size())
                     .map(|size| W::fixed(size + count));
                 self.constrain_expr(src, source);
                 size
             }
-            ExpressionTy::Range(range) => {
+            ExprKind::Range(range) => {
                 let size = match range.size {
                     RangeParam::Literal(bits) => Some(W::fixed(bits.div_ceil(8))),
                     RangeParam::MacroArg(_) => expected,
                 };
-                self.constrain_expr(&range.value, None);
+                self.constrain_expr(range.value, None);
                 size
             }
-            ExpressionTy::FunctionCall { builtin, args } => {
+            ExprKind::FunctionCall { builtin, args } => {
                 let boolean = matches!(
                     builtin,
                     Builtin::Carry | Builtin::Scarry | Builtin::Sborrow | Builtin::Nan
                 );
                 let size = boolean.then(|| W::fixed(1)).or(expected);
-                let input_size = args.iter().find_map(|arg| self.constrain_expr(arg, None));
+                let input_size = args.clone().find_map(|arg| self.constrain_expr(arg, None));
                 if let Some(input_size) = input_size {
                     for arg in args {
                         self.constrain_expr(arg, Some(input_size));
@@ -2068,54 +2173,54 @@ impl<'a, C: PcodeLoweringContext + ?Sized, W: Width> SizeInference<'a, C, W> {
                 }
                 size
             }
-            ExpressionTy::PcodeOp { args, .. } => {
+            ExprKind::PcodeOp { args, .. } => {
                 for arg in args {
                     self.constrain_expr(arg, None);
                 }
                 expected
             }
-            ExpressionTy::Unop(unop) => match unop.op {
+            ExprKind::Unop { op, e } => match op {
                 UnaryOperator::LogicalNot => {
-                    let size = self.constrain_expr(&unop.e, None);
-                    self.constrain_expr(&unop.e, size);
+                    let size = self.constrain_expr(e, None);
+                    self.constrain_expr(e, size);
                     Some(W::fixed(1))
                 }
                 UnaryOperator::AddressOf(size) => size.map(W::fixed).or_else(|| {
-                    self.storage_from_expr_size(&unop.e)
+                    self.storage_from_expr_size(e)
                         .and_then(|storage| self.context.address_size(storage.space))
                         .map(W::fixed)
                 }),
                 _ => {
-                    let size = expected.or_else(|| self.constrain_expr(&unop.e, None));
-                    self.constrain_expr(&unop.e, size);
+                    let size = expected.or_else(|| self.constrain_expr(e, None));
+                    self.constrain_expr(e, size);
                     size
                 }
             },
-            ExpressionTy::Binop(binop) => {
-                let boolean = binop.op.is_comparison()
+            ExprKind::Binop { op, lhs, rhs } => {
+                let boolean = op.is_comparison()
                     || matches!(
-                        binop.op,
+                        op,
                         BinaryOperator::LogicalXor
                             | BinaryOperator::LogicalAnd
                             | BinaryOperator::LogicalOr
                     );
                 let input_size = self
-                    .constrain_expr(&binop.lhs, None)
-                    .or_else(|| self.constrain_expr(&binop.rhs, None));
+                    .constrain_expr(lhs, None)
+                    .or_else(|| self.constrain_expr(rhs, None));
                 let input_size = if boolean {
                     input_size
                 } else {
                     expected.or(input_size)
                 };
-                self.constrain_expr(&binop.lhs, input_size);
-                self.constrain_expr(&binop.rhs, input_size);
+                self.constrain_expr(lhs, input_size);
+                self.constrain_expr(rhs, input_size);
                 if boolean {
                     Some(W::fixed(1))
                 } else {
                     input_size
                 }
             }
-            ExpressionTy::MacroCall { .. } | ExpressionTy::DeferredCall { .. } => expected,
+            ExprKind::Internal(_) => expected,
         }
     }
 }
@@ -2133,7 +2238,7 @@ impl<'a, C: PcodeLoweringContext + ?Sized, W: Width> Sizing<W> for SizeInference
 }
 
 impl<C: PcodeLoweringContext + ?Sized, S: PcodeSink + ?Sized> Sizing<usize>
-    for Lowerer<'_, '_, '_, C, S>
+    for Emitter<'_, '_, '_, C, S>
 {
     type Ctx = C;
 
@@ -2161,37 +2266,36 @@ trait Sizing<W: Width> {
     /// The width of a local variable, if it is known in this phase.
     fn local_size(&self, id: &LocalVarId) -> Option<W>;
 
-    fn expr_size<S>(&self, expr: &Expression<S>) -> Option<W> {
-        expr.size.map(W::fixed).or(match &expr.ty {
-            ExpressionTy::SizedInt { size, .. } => size.map(W::fixed),
-            ExpressionTy::Ident(ident) => self.storage_size(ident),
-            ExpressionTy::Load(load) => load.size.map(W::fixed),
-            ExpressionTy::SubPieceLsb { count, .. } => Some(W::fixed(*count)),
-            ExpressionTy::SubPieceMsb { src, count } => {
-                Some(W::fixed(self.expr_size(src)?.size()?.checked_sub(*count)?))
+    fn expr_size<E: ExprNode>(&self, expr: E) -> Option<W> {
+        expr.size().map(W::fixed).or(match expr.kind() {
+            ExprKind::SizedInt { size, .. } => size.map(W::fixed),
+            ExprKind::Ident(ident) => self.storage_size(&ident),
+            ExprKind::Load(load) => load.size.map(W::fixed),
+            ExprKind::SubPieceLsb { count, .. } => Some(W::fixed(count)),
+            ExprKind::SubPieceMsb { src, count } => {
+                Some(W::fixed(self.expr_size(src)?.size()?.checked_sub(count)?))
             }
-            ExpressionTy::Range(Range {
+            ExprKind::Range(RangeNode {
                 size: RangeParam::Literal(bits),
                 ..
             }) => Some(W::fixed(bits.div_ceil(8))),
-            ExpressionTy::Range(Range {
+            ExprKind::Range(RangeNode {
                 size: RangeParam::MacroArg(_),
                 ..
             }) => None,
-            ExpressionTy::FunctionCall {
+            ExprKind::FunctionCall {
                 builtin: Builtin::Carry | Builtin::Scarry | Builtin::Sborrow | Builtin::Nan,
                 ..
             } => Some(W::fixed(1)),
-            ExpressionTy::FunctionCall { .. } => None,
-            ExpressionTy::Unop(unop) if unop.op == UnaryOperator::LogicalNot => Some(W::fixed(1)),
-            ExpressionTy::Unop(unop) => self.expr_size(&unop.e),
-            ExpressionTy::Binop(binop) if binop.op.is_comparison() => Some(W::fixed(1)),
-            ExpressionTy::Binop(binop) => self
-                .expr_size(&binop.lhs)
-                .or_else(|| self.expr_size(&binop.rhs)),
-            ExpressionTy::PcodeOp { .. }
-            | ExpressionTy::MacroCall { .. }
-            | ExpressionTy::DeferredCall { .. } => None,
+            ExprKind::FunctionCall { .. } => None,
+            ExprKind::Unop {
+                op: UnaryOperator::LogicalNot,
+                ..
+            } => Some(W::fixed(1)),
+            ExprKind::Unop { e, .. } => self.expr_size(e),
+            ExprKind::Binop { op, .. } if op.is_comparison() => Some(W::fixed(1)),
+            ExprKind::Binop { lhs, rhs, .. } => self.expr_size(lhs).or_else(|| self.expr_size(rhs)),
+            ExprKind::PcodeOp { .. } | ExprKind::Internal(_) => None,
         })
     }
 
@@ -2213,21 +2317,21 @@ trait Sizing<W: Width> {
         }
     }
 
-    fn storage_from_expr_size<S>(&self, expr: &Expression<S>) -> Option<Varnode> {
-        match &expr.ty {
-            ExpressionTy::Ident(Ident::Register(id)) => self.context().register_varnode(*id),
-            ExpressionTy::Ident(Ident::BitRange(id)) => {
-                self.context().bitrange_info(*id).map(|info| info.storage)
+    fn storage_from_expr_size<E: ExprNode>(&self, expr: E) -> Option<Varnode> {
+        match expr.kind() {
+            ExprKind::Ident(Ident::Register(id)) => self.context().register_varnode(id),
+            ExprKind::Ident(Ident::BitRange(id)) => {
+                self.context().bitrange_info(id).map(|info| info.storage)
             }
             _ => None,
         }
     }
 
-    fn load_space<S>(&self, load: &Load<S>) -> Result<SpaceId, PcodeLowerError> {
-        match &load.space {
-            None => Ok(self.context().default_space()),
-            Some(crate::PcodeSpaceRef::Resolved(space)) => Ok(*space),
-            Some(crate::PcodeSpaceRef::Deferred(_)) => Err(PcodeLowerError::UnresolvedSpace),
+    fn load_space<E>(&self, load: &LoadNode<'_, E>) -> Result<SpaceId, PcodeLowerError> {
+        match load.space {
+            LoadSpace::Default => Ok(self.context().default_space()),
+            LoadSpace::Resolved(space) => Ok(space),
+            LoadSpace::Deferred(_) => Err(PcodeLowerError::UnresolvedSpace),
         }
     }
 }
@@ -2235,7 +2339,7 @@ trait Sizing<W: Width> {
 /// Reads a bit range's literal start and width.
 ///
 /// A macro-argument range must have been substituted during expansion.
-fn range_params<S>(range: &Range<S>) -> Result<(usize, usize), PcodeLowerError> {
+fn range_params<E>(range: &RangeNode<E>) -> Result<(usize, usize), PcodeLowerError> {
     let RangeParam::Literal(start) = range.start else {
         return Err(PcodeLowerError::UnresolvedRangeParameter);
     };
@@ -3503,5 +3607,43 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error, PcodeLowerError::InvalidDirectTarget);
+    }
+
+    #[test]
+    fn deferred_space_is_rejected_at_lowering() {
+        // A load and a store through a space compilation never resolved:
+        // both fail the same way, before any operation is emitted.
+        let load = Expression {
+            ty: ExpressionTy::Load(Load {
+                space: Some(PcodeSpaceRef::Deferred("segment".into())),
+                size: Some(4),
+                ptr: Box::new(int(0x10, 8)),
+            }),
+            size: Some(4),
+            span: (),
+        };
+        let error = lower_instruction(
+            &ast(vec![AstNode::Assignment {
+                lhs: Ident::Register(RegisterId::new(0)),
+                size: None,
+                rhs: load.clone(),
+            }]),
+            &Context,
+        )
+        .unwrap_err();
+        assert_eq!(error, PcodeLowerError::UnresolvedSpace);
+        let ExpressionTy::Load(store) = load.ty else {
+            unreachable!()
+        };
+        let error = lower_instruction(
+            &ast(vec![AstNode::LoadAssignment {
+                lhs: store,
+                size: None,
+                rhs: ident(RegisterId::new(0)),
+            }]),
+            &Context,
+        )
+        .unwrap_err();
+        assert_eq!(error, PcodeLowerError::UnresolvedSpace);
     }
 }

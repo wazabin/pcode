@@ -61,6 +61,7 @@ pub mod instruction;
 pub mod register;
 pub mod space;
 pub mod statement;
+pub mod streaming;
 
 pub use error::{PcodeError, PcodeErrorTy, PcodeResult};
 pub use expression::{

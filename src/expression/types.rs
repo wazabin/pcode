@@ -27,7 +27,7 @@ impl SpaceRef {
 }
 
 /// A bit position or width in a [`Range`], which a macro may parameterise.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RangeParam {
     /// A constant number of bits.
     Literal(usize),
