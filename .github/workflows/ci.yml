@@ -26,6 +26,13 @@ jobs:
       - run: cargo test --all-features
       - run: cargo doc --no-deps
 
+  no-downgrades:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Garfield1002/cargo-no-downgrades@v1
+
   coverage:
     runs-on: ubuntu-latest
     steps:
