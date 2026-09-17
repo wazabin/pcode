@@ -16,7 +16,7 @@ categories = ["development-tools::debugging", "encoding"]
 name = "pcode_types"
 
 [dependencies]
-jstd = { package = "wazabin-jstd", version = "0.2.0", path = "../wazabin-jstd" }
+jstd = { package = "wazabin-jstd", version = "0.2.2" }
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
