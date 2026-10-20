@@ -18,6 +18,16 @@ pub struct SpaceId(usize);
 /// The const space is used for constant values such as immediate values
 pub const SPACE_CONST: SpaceId = SpaceId(0);
 
+/// A constant that is an offset from the address of the instruction it
+/// appears in: its value is that offset, wrapping. The instruction's address
+/// plus the offset gives the constant it stands for.
+pub const SPACE_RELOC: SpaceId = SpaceId(1);
+
+/// A constant that depends on the address of the instruction it appears in,
+/// but not as a fixed offset from it — a page address, a masked address. Its
+/// value is the constant itself, valid only at that address.
+pub const SPACE_MIXED: SpaceId = SpaceId(2);
+
 /// The broad category of a memory space.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SpaceType {

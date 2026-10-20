@@ -76,7 +76,9 @@ pub use instruction::{
     plan_instruction, plan_instruction_with, resolve_body_widths,
 };
 pub use register::{Register, RegisterId, RegisterMutRef, RegisterRef};
-pub use space::{SPACE_CONST, Space, SpaceId, SpaceRef, SpaceStore, SpaceType};
+pub use space::{
+    SPACE_CONST, SPACE_MIXED, SPACE_RELOC, Space, SpaceId, SpaceRef, SpaceStore, SpaceType,
+};
 pub use statement::{Ast, AstNode, DelaySlotArg, LabelOrNode};
 
 use jstd::Identifier;
