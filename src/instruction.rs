@@ -11,8 +11,8 @@
 
 use crate::{
     Ast, AstNode, BinaryOperator, BitRangeFieldId, Builtin, Expression, ExpressionTy, Ident,
-    LabelOrNode, LocalVarId, PCodeOpId, PcodeAst, RangeParam, RegisterId, SPACE_CONST, SpaceId,
-    TableId, UnaryOperator,
+    LabelOrNode, LocalVarId, PCodeOpId, PcodeAst, RangeParam, RegisterId, SPACE_CONST, SPACE_MIXED,
+    SPACE_RELOC, SpaceId, TableId, UnaryOperator,
     streaming::{ExprKind, ExprNode, LoadNode, LoadSpace, RangeNode, StmtKind, TargetNode},
 };
 use serde::{Deserialize, Serialize};
@@ -54,6 +54,18 @@ impl Varnode {
     /// Returns whether this is a constant-space varnode.
     pub fn is_constant(self) -> bool {
         self.space == SPACE_CONST
+    }
+
+    /// Creates a [`SPACE_RELOC`] varnode: `offset` from the instruction's
+    /// address, with byte width `size`.
+    pub const fn reloc(offset: u64, size: usize) -> Self {
+        Self::new(SPACE_RELOC, offset, size)
+    }
+
+    /// Returns whether this varnode holds a value, address-dependent or not:
+    /// one in [`SPACE_CONST`], [`SPACE_RELOC`] or [`SPACE_MIXED`].
+    pub fn is_value(self) -> bool {
+        self.space == SPACE_CONST || self.space == SPACE_RELOC || self.space == SPACE_MIXED
     }
 }
 
